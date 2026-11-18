@@ -1,0 +1,8 @@
+{
+  "name": "Peru Lead Extractor Pro",
+  "description": "Herramienta avanzada de extracción de leads comerciales en Perú usando Google Maps Grounding. Genera tablas y CSVs con información de contacto verificada.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": []
+}
