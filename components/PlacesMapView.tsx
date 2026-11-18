@@ -150,32 +150,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
   selectedPlaceId,
   onSelectPlace,
 }) => {
-  const envApiKey = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '').trim();
-  const [apiKey, setApiKey] = useState<string>(envApiKey);
-  const [isCheckingKey, setIsCheckingKey] = useState<boolean>(!envApiKey);
-
-  useEffect(() => {
-    if (envApiKey) {
-      setApiKey(envApiKey);
-      setIsCheckingKey(false);
-      return;
-    }
-    let cancelled = false;
-    fetch('/api/maps-config')
-      .then((r) => (r.ok ? r.json() : { mapsApiKey: '' }))
-      .then((data) => {
-        if (!cancelled) {
-          setApiKey(String(data?.mapsApiKey || '').trim());
-          setIsCheckingKey(false);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setIsCheckingKey(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [envApiKey]);
+  const apiKey = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '').trim();
 
   return (
     <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden flex flex-col">
@@ -196,11 +171,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
       </div>
 
       <div className="relative h-[480px] w-full bg-slate-100">
-        {isCheckingKey ? (
-          <div className="h-full w-full flex items-center justify-center p-6 text-xs text-slate-500">
-            Inicializando mapa interactivo de Google Maps...
-          </div>
-        ) : !apiKey ? (
+        {!apiKey ? (
           <div className="h-full w-full flex flex-col items-center justify-center p-6 text-center">
             <MapPin className="w-8 h-8 text-slate-400 mb-2" />
             <p className="text-sm font-semibold text-slate-800">

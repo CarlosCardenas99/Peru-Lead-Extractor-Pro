@@ -27,9 +27,15 @@ import firebaseConfig from '../firebase-applet-config.json';
 import {
   DiscardRecord,
   ExclusionRecord,
+  FOLLOWUP_STAGES,
   FollowupLeadRecord,
+  FollowupStage,
+  QualificationTier,
+  WebsiteVerificationStatus,
+  PhoneVerificationStage,
 } from '../types';
 import { ParsedExclusionCandidate } from '../utils/exclusionUtils';
+import { validateLegalBasisForStage } from '../utils/leadQualifier';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -114,6 +120,66 @@ export async function testFirestoreConnection(): Promise<boolean> {
     // Permission denied on default-deny test doc still proves live connectivity
     return true;
   }
+}
+
+export interface FirestorePreflightResult {
+  ok: boolean;
+  uid: string;
+  email: string;
+  writeVerified: boolean;
+  readVerified: boolean;
+  message: string;
+}
+
+export async function verifyUserFirestoreReadWrite(uid: string): Promise<FirestorePreflightResult> {
+  const currentUser = auth.currentUser;
+  if (!currentUser || !currentUser.emailVerified || currentUser.uid !== uid) {
+    throw new Error('Debes iniciar sesión con Google (correo verificado) antes de escribir en Firestore.');
+  }
+
+  const probeId = '_healthcheck_probe';
+  const path = `users/${uid}/exclusions/${probeId}`;
+  const ref = doc(db, path);
+
+  try {
+    await setDoc(ref, {
+      ownerUid: uid,
+      type: 'placeId',
+      normalizedValue: probeId,
+      rawSample: 'preflight_check',
+      sourceLabel: 'Verificacion escritura/lectura Firestore',
+      createdAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+
+  let readVerified = false;
+  try {
+    const snap = await getDocFromServer(ref);
+    readVerified = snap.exists() && snap.data()?.ownerUid === uid;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+
+  try {
+    await deleteDoc(ref);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+
+  if (!readVerified) {
+    throw new Error('La escritura se ejecutó pero la lectura de verificación desde el servidor no devolvió el documento.');
+  }
+
+  return {
+    ok: true,
+    uid,
+    email: currentUser.email || '',
+    writeVerified: true,
+    readVerified: true,
+    message: `Sesión verificada (${currentUser.email || uid}): escritura, lectura desde servidor y limpieza en Firestore completadas correctamente.`,
+  };
 }
 
 export async function signInWithGooglePopup(): Promise<User> {
@@ -218,6 +284,32 @@ export function subscribeUserDiscards(
   );
 }
 
+function normalizeStage(rawStage: unknown): FollowupStage {
+  const str = String(rawStage || '').trim();
+  if ((FOLLOWUP_STAGES as string[]).includes(str)) {
+    return str as FollowupStage;
+  }
+  switch (str) {
+    case 'Pendiente de revisión':
+    case 'Verificado independientemente':
+      return 'PENDIENTE DE VERIFICACIÓN';
+    case 'Contactado legalmente':
+      return 'CONTACTADO';
+    case 'Respondió':
+      return 'RESPONDIÓ';
+    case 'Interesado':
+      return 'INTERESADO';
+    case 'Cotización':
+      return 'COTIZACIÓN';
+    case 'Cliente':
+      return 'CLIENTE';
+    case 'Descartado':
+      return 'DESCARTADO';
+    default:
+      return 'PRESELECCIONADO';
+  }
+}
+
 export function subscribeUserFollowups(
   uid: string,
   onData: (items: FollowupLeadRecord[]) => void,
@@ -238,16 +330,21 @@ export function subscribeUserFollowups(
           id: d.id,
           ownerUid: String(data.ownerUid || uid),
           placeId: String(data.placeId || ''),
+          sourceKind:
+            data.sourceKind === 'places_preselection' ? 'places_preselection' : 'independent_manual',
           independentBusinessName: String(data.independentBusinessName || ''),
           district: String(data.district || ''),
           confirmedNoWebsite: Boolean(data.confirmedNoWebsite),
-          independentWebsiteStatus: data.independentWebsiteStatus || 'unregistered',
+          independentWebsiteStatus: (data.independentWebsiteStatus || 'unregistered') as WebsiteVerificationStatus,
           independentPhone: String(data.independentPhone || ''),
-          phoneStage: data.phoneStage || 'none',
+          phoneStage: (data.phoneStage || 'none') as PhoneVerificationStage,
           independentEmail: String(data.independentEmail || ''),
           independentDigitalScore: Number(data.independentDigitalScore || 0),
           independentContactScore: Number(data.independentContactScore || 0),
-          stage: data.stage || 'Pendiente de revisión',
+          stage: normalizeStage(data.stage),
+          legalBasis: String(data.legalBasis || ''),
+          qualificationTier: (data.qualificationTier || '') as QualificationTier | '',
+          aiSummary: String(data.aiSummary || ''),
           notes: String(data.notes || ''),
           createdAt: toIsoString(data.createdAt),
           updatedAt: toIsoString(data.updatedAt),
@@ -344,6 +441,11 @@ export async function createFollowupRecord(
   uid: string,
   payload: Omit<FollowupLeadRecord, 'id' | 'ownerUid' | 'createdAt' | 'updatedAt'>
 ): Promise<string> {
+  const gateError = validateLegalBasisForStage(payload.stage, payload.legalBasis);
+  if (gateError) {
+    throw new Error(gateError);
+  }
+
   const safeId = sanitizeFirestoreId(
     payload.placeId ? `lead_${payload.placeId}` : `manual_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
   );
@@ -352,6 +454,7 @@ export async function createFollowupRecord(
     await setDoc(doc(db, path), {
       ownerUid: uid,
       placeId: sanitizeFirestoreId(payload.placeId || safeId),
+      sourceKind: payload.sourceKind,
       independentBusinessName: payload.independentBusinessName.trim().slice(0, 160),
       district: payload.district.trim().slice(0, 120),
       confirmedNoWebsite: Boolean(payload.confirmedNoWebsite),
@@ -362,6 +465,9 @@ export async function createFollowupRecord(
       independentDigitalScore: Math.max(0, Math.min(100, Math.round(payload.independentDigitalScore))),
       independentContactScore: Math.max(0, Math.min(100, Math.round(payload.independentContactScore))),
       stage: payload.stage,
+      legalBasis: (payload.legalBasis || '').trim().slice(0, 300),
+      qualificationTier: payload.qualificationTier || '',
+      aiSummary: (payload.aiSummary || '').trim().slice(0, 800),
       notes: payload.notes.trim().slice(0, 1000),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
@@ -370,6 +476,79 @@ export async function createFollowupRecord(
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
   }
+}
+
+/**
+ * Transfiere en lote leads preseleccionados guardando ÚNICAMENTE Place ID y metadatos propios permitidos
+ * (sin persistir nombres, direcciones ni teléfonos procedentes de Google Maps).
+ * Evita duplicar registros existentes en Followup.
+ */
+export async function createBatchPreselectedFollowups(
+  uid: string,
+  items: Array<{
+    placeId: string;
+    confirmedNoWebsite: boolean;
+    independentWebsiteStatus: WebsiteVerificationStatus;
+    phoneStage: PhoneVerificationStage;
+    independentDigitalScore: number;
+    independentContactScore: number;
+    stage: 'PRESELECCIONADO' | 'PENDIENTE DE VERIFICACIÓN';
+    qualificationTier: QualificationTier;
+    aiSummary: string;
+    notes: string;
+  }>,
+  existingPlaceIds: Set<string>
+): Promise<{ created: number; skippedDuplicates: number }> {
+  const toCreate = items.filter((item) => item.placeId && !existingPlaceIds.has(item.placeId));
+  const skippedDuplicates = items.length - toCreate.length;
+  if (toCreate.length === 0) {
+    return { created: 0, skippedDuplicates };
+  }
+
+  const path = `users/${uid}/followups`;
+  const CHUNK_SIZE = 400;
+  let created = 0;
+
+  for (let i = 0; i < toCreate.length; i += CHUNK_SIZE) {
+    const slice = toCreate.slice(i, i + CHUNK_SIZE);
+    const batch = writeBatch(db);
+
+    for (const item of slice) {
+      const cleanPlaceId = sanitizeFirestoreId(item.placeId);
+      const docId = sanitizeFirestoreId(`lead_${cleanPlaceId}`);
+      const ref = doc(db, path, docId);
+      batch.set(ref, {
+        ownerUid: uid,
+        placeId: cleanPlaceId,
+        sourceKind: 'places_preselection',
+        independentBusinessName: '',
+        district: '',
+        confirmedNoWebsite: Boolean(item.confirmedNoWebsite),
+        independentWebsiteStatus: item.independentWebsiteStatus,
+        independentPhone: '',
+        phoneStage: item.phoneStage,
+        independentEmail: '',
+        independentDigitalScore: Math.max(0, Math.min(100, Math.round(item.independentDigitalScore))),
+        independentContactScore: Math.max(0, Math.min(100, Math.round(item.independentContactScore))),
+        stage: item.stage,
+        legalBasis: '',
+        qualificationTier: item.qualificationTier,
+        aiSummary: (item.aiSummary || '').trim().slice(0, 800),
+        notes: (item.notes || '').trim().slice(0, 1000),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    try {
+      await batch.commit();
+      created += slice.length;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  return { created, skippedDuplicates };
 }
 
 export async function updateFollowupRecord(
@@ -388,10 +567,25 @@ export async function updateFollowupRecord(
       | 'independentDigitalScore'
       | 'independentContactScore'
       | 'stage'
+      | 'legalBasis'
+      | 'qualificationTier'
+      | 'aiSummary'
       | 'notes'
     >
-  >
+  >,
+  currentRecord?: FollowupLeadRecord
 ): Promise<void> {
+  if (typeof updates.stage === 'string') {
+    const effectiveLegalBasis =
+      typeof updates.legalBasis === 'string'
+        ? updates.legalBasis
+        : currentRecord?.legalBasis || '';
+    const gateError = validateLegalBasisForStage(updates.stage, effectiveLegalBasis);
+    if (gateError) {
+      throw new Error(gateError);
+    }
+  }
+
   const safeId = sanitizeFirestoreId(followupId);
   const path = `users/${uid}/followups/${safeId}`;
   const cleanPayload: Record<string, unknown> = {
@@ -427,6 +621,15 @@ export async function updateFollowupRecord(
   }
   if (typeof updates.stage === 'string') {
     cleanPayload.stage = updates.stage;
+  }
+  if (typeof updates.legalBasis === 'string') {
+    cleanPayload.legalBasis = updates.legalBasis.trim().slice(0, 300);
+  }
+  if (typeof updates.qualificationTier === 'string') {
+    cleanPayload.qualificationTier = updates.qualificationTier;
+  }
+  if (typeof updates.aiSummary === 'string') {
+    cleanPayload.aiSummary = updates.aiSummary.trim().slice(0, 800);
   }
   if (typeof updates.notes === 'string') {
     cleanPayload.notes = updates.notes.trim().slice(0, 1000);

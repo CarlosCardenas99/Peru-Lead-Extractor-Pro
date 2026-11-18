@@ -16,16 +16,21 @@ function escapeCsvCell(value: string | number | boolean): string {
 /**
  * Exporta EXCLUSIVAMENTE registros del módulo de seguimiento CRM que contienen
  * datos obtenidos independientemente o ingresados manualmente por el equipo WEBNEX.
- * Nunca exporta masivamente contenido restringido de Google Maps.
+ * Nunca exporta contenido ni referencias hidratadas de Google Maps.
  */
 export const ExportButton: React.FC<ExportButtonProps> = ({ followups }) => {
+  const exportableRecords = followups.filter(
+    (item) => item.independentBusinessName.trim().length > 0
+  );
+
   const downloadCSV = () => {
-    if (followups.length === 0) return;
+    if (exportableRecords.length === 0) return;
 
     const headers = [
       'Nombre Comercial Independiente',
       'Distrito / Zona',
       'Estado Seguimiento',
+      'Base Legal / Evidencia Consentimiento',
       'Confirmado Sin Web',
       'Estado Web Independiente',
       'Teléfono Independiente',
@@ -37,11 +42,12 @@ export const ExportButton: React.FC<ExportButtonProps> = ({ followups }) => {
       'Actualizado',
     ];
 
-    const rows = followups.map((item) =>
+    const rows = exportableRecords.map((item) =>
       [
         escapeCsvCell(item.independentBusinessName),
         escapeCsvCell(item.district),
         escapeCsvCell(item.stage),
+        escapeCsvCell(item.legalBasis),
         escapeCsvCell(item.confirmedNoWebsite ? 'Sí' : 'No'),
         escapeCsvCell(item.independentWebsiteStatus),
         escapeCsvCell(item.independentPhone),
@@ -69,13 +75,17 @@ export const ExportButton: React.FC<ExportButtonProps> = ({ followups }) => {
   return (
     <button
       type="button"
-      disabled={followups.length === 0}
+      disabled={exportableRecords.length === 0}
       onClick={downloadCSV}
       className="bg-purple-700 hover:bg-purple-800 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium py-2 px-4 rounded-lg text-xs inline-flex items-center gap-2 transition-colors whitespace-nowrap shrink-0"
-      title="Exporta únicamente registros del CRM con datos verificados independientemente"
+      title={
+        exportableRecords.length === 0
+          ? 'Solo exportable cuando los registros cuentan con datos ingresados independientemente'
+          : 'Exporta únicamente registros con datos independientes (sin datos de Google Maps)'
+      }
     >
       <Download className="w-4 h-4" />
-      Exportar CRM ({followups.length})
+      Exportar CRM Indep. ({exportableRecords.length})
     </button>
   );
 };

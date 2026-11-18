@@ -6,6 +6,12 @@ import {
   parseExclusionBatchInput,
 } from '../utils/exclusionUtils';
 import {
+  buildCrmAndDuplicateSets,
+  matchesSmartFilters,
+  qualifyLoadedLeadsBatch,
+  validateLegalBasisForStage,
+} from '../utils/leadQualifier';
+import {
   computeContactabilityScore,
   computeDigitalOpportunityScore,
   computeIndependentFunnelMetrics,
@@ -13,10 +19,19 @@ import {
 } from '../utils/scoring';
 import { isPrivateOrReservedIp, validateAndResolveSafeUrl } from '../server/ssrfGuard';
 import { verifyWebsiteIndependently } from '../server/websiteVerifier';
+import { extractHtmlSignals } from '../server/websiteMetadataExtractor';
+import { parseGeminiAnalystResponse, sanitizeAnalystInput } from '../server/geminiAnalystService';
 import { DailyQuotaGuard } from '../server/quotaGuard';
 import { mapGooglePlacePayload, searchPlacesNewApi } from '../server/placesService';
 import { parseSubzoneGeminiResponse } from '../server/geminiSubzoneService';
-import { ExclusionRecord, FollowupLeadRecord, GooglePlaceRaw } from '../types';
+import { buildBusinessLeadFromPlace } from '../services/geminiService';
+import { formatFriendlyFirestoreError } from '../services/firebaseService';
+import {
+  DEFAULT_SMART_FILTERS,
+  ExclusionRecord,
+  FollowupLeadRecord,
+  GooglePlaceRaw,
+} from '../types';
 
 describe('1. Deduplicación por Place ID y sucursales', () => {
   it('elimina duplicados con mismo placeId pero conserva sucursales con distinto placeId', () => {
@@ -38,9 +53,7 @@ describe('1. Deduplicación por Place ID y sucursales', () => {
     ];
 
     const page2: GooglePlaceRaw[] = [
-      // Mismo placeId -> debe deduplicarse
       { ...page1[0] },
-      // Misma marca, distinta sucursal y distinto placeId -> debe conservarse
       {
         ...page1[0],
         placeId: 'ChIJ_branch_2',
@@ -54,28 +67,45 @@ describe('1. Deduplicación por Place ID y sucursales', () => {
   });
 });
 
-describe('2. Normalización de teléfonos peruanos sin asumir WhatsApp', () => {
-  it('normaliza móviles, fijos de Lima y regionales, y maneja ausentes o inválidos', () => {
-    const mobile = analyzePeruvianPhone('987-654-321');
-    expect(mobile.isValidFormat).toBe(true);
-    expect(mobile.e164).toBe('+51987654321');
-    expect(mobile.formatted).toBe('+51 987 654 321');
-    expect(mobile.lineType).toBe('mobile');
-    expect(mobile.note.toLowerCase()).toContain('whatsapp no asumido');
+describe('2. Normalización de teléfonos peruanos sin asumir WhatsApp ni convertir desconocidos', () => {
+  it('normaliza móviles (con/sin +51), fijos 01 y regionales, y nunca convierte inválidos en móviles', () => {
+    const mobileNoPrefix = analyzePeruvianPhone('987-654-321');
+    expect(mobileNoPrefix.isValidFormat).toBe(true);
+    expect(mobileNoPrefix.e164).toBe('+51987654321');
+    expect(mobileNoPrefix.lineType).toBe('mobile');
+    expect(mobileNoPrefix.note.toLowerCase()).toContain('whatsapp no asumido');
+
+    const mobileWithPrefix = analyzePeruvianPhone('+51 912 345 678');
+    expect(mobileWithPrefix.isValidFormat).toBe(true);
+    expect(mobileWithPrefix.e164).toBe('+51912345678');
+    expect(mobileWithPrefix.lineType).toBe('mobile');
 
     const lima = analyzePeruvianPhone('(01) 456-7890');
     expect(lima.isValidFormat).toBe(true);
     expect(lima.e164).toBe('+5114567890');
     expect(lima.lineType).toBe('landline_lima');
 
+    const limaWithCountry = analyzePeruvianPhone('+51 (01) 456-7890');
+    expect(limaWithCountry.isValidFormat).toBe(true);
+    expect(limaWithCountry.lineType).toBe('landline_lima');
+
     const arequipa = analyzePeruvianPhone('+51 54 234567');
     expect(arequipa.isValidFormat).toBe(true);
     expect(arequipa.e164).toBe('+5154234567');
     expect(arequipa.lineType).toBe('landline_regional');
 
-    const invalid = analyzePeruvianPhone('12345');
-    expect(invalid.isValidFormat).toBe(false);
-    expect(invalid.stage).toBe('registered_invalid');
+    const trujillo = analyzePeruvianPhone('044 221133');
+    expect(trujillo.isValidFormat).toBe(true);
+    expect(trujillo.lineType).toBe('landline_regional');
+
+    const invalidShort = analyzePeruvianPhone('12345');
+    expect(invalidShort.isValidFormat).toBe(false);
+    expect(invalidShort.lineType).toBe('invalid');
+    expect(invalidShort.stage).toBe('registered_invalid');
+
+    const unknownNineDigits = analyzePeruvianPhone('800123456');
+    expect(unknownNineDigits.isValidFormat).toBe(false);
+    expect(unknownNineDigits.lineType).toBe('invalid');
 
     const absent = analyzePeruvianPhone(null);
     expect(absent.lineType).toBe('none');
@@ -100,7 +130,6 @@ describe('3. Verificador web SSRF y clasificación inconclusa', () => {
       expect(dnsToPrivate.code).toBe('SSRF_BLOCKED');
     }
 
-    // Redirect hop targeting 169.254.169.254 must be blocked cleanly
     const redirectSsrf = await verifyWebsiteIndependently('https://public-site.pe', {
       dnsLookupFn: async () => [{ address: '93.184.216.34', family: 4 }],
       fetchFn: async () =>
@@ -181,7 +210,7 @@ describe('3. Verificador web SSRF y clasificación inconclusa', () => {
   });
 });
 
-describe('4. Separación de Puntuación Digital vs Contactabilidad y Métricas', () => {
+describe('4. Separación de Puntuación Digital vs Contactabilidad y Métricas (9 etapas)', () => {
   it('mantiene Oportunidad Digital independiente de teléfono o reseñas', () => {
     const unregisteredProbe = {
       checkedUrl: null,
@@ -211,16 +240,16 @@ describe('4. Separación de Puntuación Digital vs Contactabilidad y Métricas',
     expect(scoreNoPhone.score).toBe(85);
     expect(contactNoPhone.score).toBe(0);
     expect(contactCorroborated.score).toBe(85);
-    // Digital score stays identical regardless of contactability
     expect(computeDigitalOpportunityScore(unregisteredProbe, false).score).toBe(scoreNoPhone.score);
   });
 
-  it('calcula las 7 métricas independientes correctamente', () => {
+  it('calcula métricas del cualificador y embudo con las 9 etapas actualizadas', () => {
     const followups: FollowupLeadRecord[] = [
       {
         id: '1',
         ownerUid: 'u1',
         placeId: 'p1',
+        sourceKind: 'independent_manual',
         independentBusinessName: 'Negocio A',
         district: 'Los Olivos',
         confirmedNoWebsite: true,
@@ -230,7 +259,10 @@ describe('4. Separación de Puntuación Digital vs Contactabilidad y Métricas',
         independentEmail: '',
         independentDigitalScore: 100,
         independentContactScore: 85,
-        stage: 'Cliente',
+        stage: 'CLIENTE',
+        legalBasis: 'Contrato directo firmado',
+        qualificationTier: 'PRIORIDAD ALTA',
+        aiSummary: '',
         notes: '',
         createdAt: '',
         updatedAt: '',
@@ -239,6 +271,7 @@ describe('4. Separación de Puntuación Digital vs Contactabilidad y Métricas',
         id: '2',
         ownerUid: 'u1',
         placeId: 'p2',
+        sourceKind: 'independent_manual',
         independentBusinessName: 'Negocio B',
         district: 'Miraflores',
         confirmedNoWebsite: true,
@@ -248,7 +281,10 @@ describe('4. Separación de Puntuación Digital vs Contactabilidad y Métricas',
         independentEmail: '',
         independentDigitalScore: 100,
         independentContactScore: 70,
-        stage: 'Cotización',
+        stage: 'COTIZACIÓN',
+        legalBasis: 'Solicitó propuesta por formulario web',
+        qualificationTier: 'PRIORIDAD ALTA',
+        aiSummary: '',
         notes: '',
         createdAt: '',
         updatedAt: '',
@@ -257,8 +293,9 @@ describe('4. Separación de Puntuación Digital vs Contactabilidad y Métricas',
         id: '3',
         ownerUid: 'u1',
         placeId: 'p3',
-        independentBusinessName: 'Negocio C',
-        district: 'Surco',
+        sourceKind: 'places_preselection',
+        independentBusinessName: '',
+        district: '',
         confirmedNoWebsite: false,
         independentWebsiteStatus: 'unregistered',
         independentPhone: '',
@@ -266,7 +303,10 @@ describe('4. Separación de Puntuación Digital vs Contactabilidad y Métricas',
         independentEmail: '',
         independentDigitalScore: 85,
         independentContactScore: 45,
-        stage: 'Pendiente de revisión',
+        stage: 'PRESELECCIONADO',
+        legalBasis: '',
+        qualificationTier: 'REVISIÓN PENDIENTE',
+        aiSummary: '',
         notes: '',
         createdAt: '',
         updatedAt: '',
@@ -277,6 +317,9 @@ describe('4. Separación de Puntuación Digital vs Contactabilidad y Métricas',
     expect(metrics.uniqueBusinessesFound).toBe(0);
     expect(metrics.corroboratedRecords).toBe(2);
     expect(metrics.verifiableDigitalOpportunities).toBe(2);
+    expect(metrics.preselectedCount).toBe(1);
+    expect(metrics.pendingCorroborationCount).toBe(1);
+    expect(metrics.authorizedContactsCount).toBe(2);
     expect(metrics.authorizedContactsMade).toBe(2);
     expect(metrics.responsesReceived).toBe(2);
     expect(metrics.qualifiedOpportunities).toBe(1);
@@ -291,7 +334,6 @@ describe('5. Importación masiva de lista de exclusión (4,767 descartados WEBNE
       const num = 900000000 + i;
       lines.push(`${num}`);
     }
-    // Add a duplicate and a domain
     lines.push('+51 900 000 000');
     lines.push('https://www.cliente-actual.pe/contacto');
 
@@ -299,7 +341,7 @@ describe('5. Importación masiva de lista de exclusión (4,767 descartados WEBNE
     const existingKeys = buildExclusionKeySet(existingRecords);
     const parsed = parseExclusionBatchInput(lines.join('\n'), existingKeys, 10000);
 
-    expect(parsed.uniqueEntries).toHaveLength(4768); // 4767 phones + 1 domain
+    expect(parsed.uniqueEntries).toHaveLength(4768);
     expect(parsed.skippedDuplicates).toBe(1);
 
     const newKeys = new Set<string>(
@@ -363,5 +405,312 @@ describe('6. Places API (New), Gemini parsing y control de cuota diaria', () => 
 
     expect(() => parseSubzoneGeminiResponse('')).toThrow();
     expect(() => parseSubzoneGeminiResponse('no json here')).toThrow();
+  });
+
+  it('soporta GOOGLE_MAPS_PLATFORM_KEY y no inventa teléfonos ni webs ausentes', async () => {
+    const prevPlatform = process.env.GOOGLE_MAPS_PLATFORM_KEY;
+    const prevApi = process.env.GOOGLE_MAPS_API_KEY;
+    const prevVite = process.env.VITE_GOOGLE_MAPS_API_KEY;
+    try {
+      process.env.GOOGLE_MAPS_PLATFORM_KEY = 'platform_test_key';
+      delete process.env.GOOGLE_MAPS_API_KEY;
+      delete process.env.VITE_GOOGLE_MAPS_API_KEY;
+
+      let sentHeaderKey: string | null = null;
+      const res = await searchPlacesNewApi({
+        textQuery: 'Veterinarias en Los Olivos, Lima, Perú',
+        fetchFn: async (_url, init) => {
+          const headers = init?.headers as Record<string, string>;
+          sentHeaderKey = headers['X-Goog-Api-Key'] || null;
+          return new Response(
+            JSON.stringify({
+              places: [
+                {
+                  id: 'ChIJ_vet_1',
+                  displayName: { text: 'Veterinaria Sin Web Ni Tel' },
+                  formattedAddress: 'Los Olivos, Lima',
+                  location: { latitude: -11.98, longitude: -77.06 },
+                  nationalPhoneNumber: null,
+                  internationalPhoneNumber: null,
+                  websiteUri: null,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        },
+      });
+      expect(sentHeaderKey).toBe('platform_test_key');
+      expect(res.places).toHaveLength(1);
+
+      const lead = buildBusinessLeadFromPlace(res.places[0], 'Veterinarias', new Set());
+      expect(lead.placeId).toBe('ChIJ_vet_1');
+      expect(lead.phone).toBe('Sin teléfono');
+      expect(lead.phoneAnalysis.stage).toBe('none');
+      expect(lead.website).toBe('');
+      expect(lead.websiteProbe.status).toBe('unregistered');
+      expect(lead.location).toEqual({ lat: -11.98, lng: -77.06 });
+    } finally {
+      if (prevPlatform !== undefined) process.env.GOOGLE_MAPS_PLATFORM_KEY = prevPlatform;
+      else delete process.env.GOOGLE_MAPS_PLATFORM_KEY;
+      if (prevApi !== undefined) process.env.GOOGLE_MAPS_API_KEY = prevApi;
+      if (prevVite !== undefined) process.env.VITE_GOOGLE_MAPS_API_KEY = prevVite;
+    }
+  });
+});
+
+describe('7. WEBNEX Smart Lead Qualifier: Filtros combinables, Preselección sin duplicados y Gate Legal', () => {
+  const mkRaw = (overrides: Partial<GooglePlaceRaw>): GooglePlaceRaw => ({
+    placeId: 'ChIJ_default',
+    displayName: 'Negocio Test',
+    formattedAddress: 'Av. Carlos Izaguirre 100, Los Olivos',
+    location: { lat: -11.99, lng: -77.06 },
+    nationalPhoneNumber: '987 654 321',
+    internationalPhoneNumber: '+51 987 654 321',
+    websiteUri: null,
+    googleMapsUri: 'https://maps.google.com/?cid=99',
+    rating: 4.4,
+    userRatingCount: 25,
+    businessStatus: 'OPERATIONAL',
+    primaryTypeDisplayName: 'Veterinaria',
+    ...overrides,
+  });
+
+  it('clasifica PRIORIDAD ALTA, REVISIÓN PENDIENTE y NO ELEGIBLE, y evita duplicados al re-ejecutar', () => {
+    const leadConfirmedNoWeb = buildBusinessLeadFromPlace(
+      mkRaw({ placeId: 'ChIJ_high', nationalPhoneNumber: '987 654 321', websiteUri: null }),
+      'Veterinarias',
+      new Set()
+    );
+    leadConfirmedNoWeb.confirmedNoWebsite = true;
+    leadConfirmedNoWeb.websiteProbe = {
+      ...leadConfirmedNoWeb.websiteProbe,
+      status: 'confirmed_none',
+      provenance: 'manual_user',
+    };
+
+    const leadUnregisteredMobile = buildBusinessLeadFromPlace(
+      mkRaw({ placeId: 'ChIJ_pending', nationalPhoneNumber: '912 345 678', websiteUri: null }),
+      'Veterinarias',
+      new Set()
+    );
+
+    const leadLandlineLima = buildBusinessLeadFromPlace(
+      mkRaw({
+        placeId: 'ChIJ_fijo_lima',
+        nationalPhoneNumber: '(01) 456-7890',
+        internationalPhoneNumber: '+51 1 4567890',
+        websiteUri: null,
+      }),
+      'Veterinarias',
+      new Set()
+    );
+
+    const leadNoPhone = buildBusinessLeadFromPlace(
+      mkRaw({
+        placeId: 'ChIJ_no_phone',
+        nationalPhoneNumber: null,
+        internationalPhoneNumber: null,
+        websiteUri: null,
+      }),
+      'Veterinarias',
+      new Set()
+    );
+
+    const leadExcluded = buildBusinessLeadFromPlace(
+      mkRaw({ placeId: 'ChIJ_excl', nationalPhoneNumber: '999 111 222' }),
+      'Veterinarias',
+      new Set(['placeId:ChIJ_excl'])
+    );
+
+    const batch1 = qualifyLoadedLeadsBatch(
+      [leadConfirmedNoWeb, leadUnregisteredMobile, leadLandlineLima, leadNoPhone, leadExcluded],
+      {
+        discardedPlaceIds: new Set(),
+        existingFollowups: [],
+      }
+    );
+
+    expect(batch1.summary.totalEvaluated).toBe(5);
+    expect(batch1.summary.highPriorityCount).toBe(1);
+    expect(batch1.summary.pendingReviewCount).toBe(1);
+    expect(batch1.summary.notEligibleCount).toBe(3);
+    expect(batch1.summary.discardedLandlineCount).toBe(1);
+    expect(batch1.summary.noMobileCount).toBe(2); // landline + no phone
+
+    const tierById = new Map(batch1.results.map((r) => [r.placeId, r.tier]));
+    expect(tierById.get('ChIJ_high')).toBe('PRIORIDAD ALTA');
+    expect(tierById.get('ChIJ_pending')).toBe('REVISIÓN PENDIENTE');
+    expect(tierById.get('ChIJ_fijo_lima')).toBe('NO ELEGIBLE');
+    expect(tierById.get('ChIJ_no_phone')).toBe('NO ELEGIBLE');
+    expect(tierById.get('ChIJ_excl')).toBe('NO ELEGIBLE');
+
+    // Al re-ejecutar el botón cuando ChIJ_high ya fue transferido a Followup, NO debe duplicarse
+    const existingFollowup: FollowupLeadRecord = {
+      id: 'lead_ChIJ_high',
+      ownerUid: 'u1',
+      placeId: 'ChIJ_high',
+      sourceKind: 'places_preselection',
+      independentBusinessName: '',
+      district: '',
+      confirmedNoWebsite: true,
+      independentWebsiteStatus: 'confirmed_none',
+      independentPhone: '',
+      phoneStage: 'registered_valid_format',
+      independentEmail: '',
+      independentDigitalScore: 100,
+      independentContactScore: 45,
+      stage: 'PRESELECCIONADO',
+      legalBasis: '',
+      qualificationTier: 'PRIORIDAD ALTA',
+      aiSummary: '',
+      notes: '',
+      createdAt: '',
+      updatedAt: '',
+    };
+
+    const batch2 = qualifyLoadedLeadsBatch([leadConfirmedNoWeb, leadUnregisteredMobile], {
+      discardedPlaceIds: new Set(),
+      existingFollowups: [existingFollowup],
+    });
+    expect(batch2.summary.alreadyInCrmSkippedCount).toBe(1);
+    expect(batch2.results.find((r) => r.placeId === 'ChIJ_high')?.tier).toBe('NO ELEGIBLE');
+    expect(batch2.results.find((r) => r.placeId === 'ChIJ_pending')?.tier).toBe('REVISIÓN PENDIENTE');
+  });
+
+  it('aplica filtros combinables correctamente sin mezclar fijos ni clientes', () => {
+    const mobileNoWeb = buildBusinessLeadFromPlace(
+      mkRaw({ placeId: 'p_mob_noweb', nationalPhoneNumber: '987654321', websiteUri: null }),
+      'Vet',
+      new Set()
+    );
+    const landlineNoWeb = buildBusinessLeadFromPlace(
+      mkRaw({
+        placeId: 'p_fijo',
+        nationalPhoneNumber: '01 444 5555',
+        internationalPhoneNumber: '+51 1 4445555',
+        websiteUri: null,
+      }),
+      'Vet',
+      new Set()
+    );
+    const clientLead = buildBusinessLeadFromPlace(
+      mkRaw({ placeId: 'p_client', nationalPhoneNumber: '988777666', websiteUri: null }),
+      'Vet',
+      new Set()
+    );
+
+    const followups: FollowupLeadRecord[] = [
+      {
+        id: 'lead_p_client',
+        ownerUid: 'u1',
+        placeId: 'p_client',
+        sourceKind: 'independent_manual',
+        independentBusinessName: 'Cliente Actual',
+        district: 'Lima',
+        confirmedNoWebsite: true,
+        independentWebsiteStatus: 'confirmed_none',
+        independentPhone: '+51 988 777 666',
+        phoneStage: 'contact_reached',
+        independentEmail: '',
+        independentDigitalScore: 100,
+        independentContactScore: 85,
+        stage: 'CLIENTE',
+        legalBasis: 'Cliente activo',
+        qualificationTier: 'PRIORIDAD ALTA',
+        aiSummary: '',
+        notes: '',
+        createdAt: '',
+        updatedAt: '',
+      },
+    ];
+
+    const all = [mobileNoWeb, landlineNoWeb, clientLead];
+    const { followupByPlaceId } = buildCrmAndDuplicateSets(all, followups);
+
+    const filtered = all.filter((l) =>
+      matchesSmartFilters(
+        l,
+        {
+          ...DEFAULT_SMART_FILTERS,
+          mobileOnly: true,
+          excludeLandlines: true,
+          mobileAndNoWebsite: true,
+          excludeClientsDiscardsDuplicates: true,
+        },
+        {
+          discardedPlaceIds: new Set(),
+          followupByPlaceId,
+          showExcludedAndDiscarded: false,
+        }
+      )
+    );
+    expect(filtered.map((l) => l.placeId)).toEqual(['p_mob_noweb']);
+  });
+
+  it('impone el gate de consentimiento/base legal para CONTACTO AUTORIZADO y manejo de errores Firebase/Gemini', () => {
+    expect(validateLegalBasisForStage('PRESELECCIONADO', '')).toBeNull();
+    expect(validateLegalBasisForStage('PENDIENTE DE VERIFICACIÓN', '')).toBeNull();
+    expect(validateLegalBasisForStage('CONTACTO AUTORIZADO', '')).toContain('consentimiento');
+    expect(validateLegalBasisForStage('CONTACTADO', 'ok')).toContain('mínimo 8 caracteres');
+    expect(
+      validateLegalBasisForStage('CONTACTO AUTORIZADO', 'Solicitud directa por correo corporativo')
+    ).toBeNull();
+
+    // PII stripping in HTML extractor before Gemini
+    const meta = extractHtmlSignals(
+      '<html><head><title>Veterinaria | +51 987 654 321</title><meta name="description" content="Escríbenos a info@vet.pe"><meta name="viewport" content="width=device-width"></head><body><h1>Servicios Veterinarios</h1></body></html>',
+      'https://vet.pe',
+      200
+    );
+    expect(meta.title).toContain('[tel]');
+    expect(meta.title).not.toContain('987');
+    expect(meta.metaDescription).toContain('[email]');
+    expect(meta.hasViewportMeta).toBe(true);
+
+    // Sanitizador y parser de Gemini
+    const sanitized = sanitizeAnalystInput({
+      placeId: 'ChIJ_1',
+      category: 'Veterinarias',
+      websiteStatus: 'active_http',
+      userNotes: 'Nota propia',
+      websiteMeta: meta,
+    });
+    expect(sanitized.placeId).toBe('ChIJ_1');
+
+    const parsed = parseGeminiAnalystResponse(
+      JSON.stringify({
+        analyses: [
+          {
+            placeId: 'ChIJ_1',
+            digitalNeeds: ['Migrar a HTTPS'],
+            recommendedWebnexServices: ['Diseño Web + SSL'],
+            commercialRelevance: 'Sitio actual sin HTTPS.',
+            missingInformation: ['Confirmar titularidad'],
+            manualVerificationSteps: ['Revisar certificado SSL'],
+            analyzedSourceNote: 'HTML público del sitio',
+          },
+          {
+            placeId: 'ChIJ_invented',
+            digitalNeeds: ['Ignorar'],
+            recommendedWebnexServices: [],
+            commercialRelevance: 'No permitido',
+            missingInformation: [],
+            manualVerificationSteps: [],
+            analyzedSourceNote: '',
+          },
+        ],
+      }),
+      new Set(['ChIJ_1'])
+    );
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].placeId).toBe('ChIJ_1');
+
+    expect(formatFriendlyFirestoreError(new Error('Missing or insufficient permissions'))).toContain(
+      'reglas de seguridad'
+    );
+    expect(formatFriendlyFirestoreError(new Error('resource-exhausted Quota exceeded'))).toContain(
+      'Spark'
+    );
   });
 });

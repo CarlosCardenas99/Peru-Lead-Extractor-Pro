@@ -77,6 +77,17 @@ export interface GooglePlaceRaw {
   primaryTypeDisplayName: string | null;
 }
 
+export interface HydratedPlaceDetails {
+  placeId: string;
+  displayName: string;
+  formattedAddress: string;
+  nationalPhoneNumber: string | null;
+  internationalPhoneNumber: string | null;
+  websiteUri: string | null;
+  googleMapsUri: string;
+  businessStatus: string | null;
+}
+
 export interface BusinessLead {
   // Primary deduplication key (Google Place ID)
   placeId: string;
@@ -121,6 +132,26 @@ export type WebsiteFilterOption =
   | 'active_http'
   | 'active_https';
 
+export interface SmartFilterState {
+  mobileOnly: boolean;
+  excludeLandlines: boolean;
+  mobileAndNoWebsite: boolean;
+  socialOnly: boolean;
+  corroboratedWebFailure: boolean;
+  pendingVerification: boolean;
+  excludeClientsDiscardsDuplicates: boolean;
+}
+
+export const DEFAULT_SMART_FILTERS: SmartFilterState = {
+  mobileOnly: false,
+  excludeLandlines: false,
+  mobileAndNoWebsite: false,
+  socialOnly: false,
+  corroboratedWebFailure: false,
+  pendingVerification: false,
+  excludeClientsDiscardsDuplicates: true,
+};
+
 export interface SearchParams {
   businessType: string;
   location: string;
@@ -138,30 +169,81 @@ export interface ScrapingState {
 }
 
 export type FollowupStage =
-  | 'Pendiente de revisión'
-  | 'Verificado independientemente'
-  | 'Contactado legalmente'
-  | 'Respondió'
-  | 'Interesado'
-  | 'Cotización'
-  | 'Cliente'
-  | 'Descartado';
+  | 'PRESELECCIONADO'
+  | 'PENDIENTE DE VERIFICACIÓN'
+  | 'CONTACTO AUTORIZADO'
+  | 'CONTACTADO'
+  | 'RESPONDIÓ'
+  | 'INTERESADO'
+  | 'COTIZACIÓN'
+  | 'CLIENTE'
+  | 'DESCARTADO';
 
 export const FOLLOWUP_STAGES: FollowupStage[] = [
-  'Pendiente de revisión',
-  'Verificado independientemente',
-  'Contactado legalmente',
-  'Respondió',
-  'Interesado',
-  'Cotización',
-  'Cliente',
-  'Descartado',
+  'PRESELECCIONADO',
+  'PENDIENTE DE VERIFICACIÓN',
+  'CONTACTO AUTORIZADO',
+  'CONTACTADO',
+  'RESPONDIÓ',
+  'INTERESADO',
+  'COTIZACIÓN',
+  'CLIENTE',
+  'DESCARTADO',
 ];
+
+export const AUTHORIZED_OUTREACH_STAGES: ReadonlySet<FollowupStage> = new Set([
+  'CONTACTO AUTORIZADO',
+  'CONTACTADO',
+  'RESPONDIÓ',
+  'INTERESADO',
+  'COTIZACIÓN',
+  'CLIENTE',
+]);
+
+export type FollowupSourceKind = 'places_preselection' | 'independent_manual';
+
+export type QualificationTier = 'PRIORIDAD ALTA' | 'REVISIÓN PENDIENTE' | 'NO ELEGIBLE';
+
+export interface GeminiComplementaryAnalysis {
+  placeId: string;
+  digitalNeeds: string[];
+  recommendedWebnexServices: string[];
+  commercialRelevance: string;
+  missingInformation: string[];
+  manualVerificationSteps: string[];
+  analyzedSourceNote: string;
+}
+
+export interface LeadQualificationResult {
+  placeId: string;
+  tier: QualificationTier;
+  digitalScore: number;
+  contactabilityScore: number;
+  reasons: string[];
+  missingInformation: string[];
+  isLandlineOnly: boolean;
+  hasMobile: boolean;
+  excludedReason: string | null;
+  alreadyInFollowup: boolean;
+  geminiAnalysis: GeminiComplementaryAnalysis | null;
+}
+
+export interface QualifierBatchSummary {
+  totalEvaluated: number;
+  highPriorityCount: number;
+  pendingReviewCount: number;
+  notEligibleCount: number;
+  discardedLandlineCount: number;
+  noMobileCount: number;
+  duplicatesAndExcludedCount: number;
+  alreadyInCrmSkippedCount: number;
+}
 
 export interface FollowupLeadRecord {
   id: string;
   ownerUid: string;
   placeId: string;
+  sourceKind: FollowupSourceKind;
   independentBusinessName: string;
   district: string;
   confirmedNoWebsite: boolean;
@@ -172,6 +254,9 @@ export interface FollowupLeadRecord {
   independentDigitalScore: number;
   independentContactScore: number;
   stage: FollowupStage;
+  legalBasis: string;
+  qualificationTier: QualificationTier | '';
+  aiSummary: string;
   notes: string;
   createdAt: string;
   updatedAt: string;
@@ -205,8 +290,14 @@ export interface QuotaStatus {
 
 export interface IndependentFunnelMetrics {
   uniqueBusinessesFound: number;
+  discardedLandlineCount: number;
+  noMobileCount: number;
   corroboratedRecords: number;
   verifiableDigitalOpportunities: number;
+  pendingCorroborationCount: number;
+  preselectedCount: number;
+  duplicatesAndExcludedCount: number;
+  authorizedContactsCount: number;
   authorizedContactsMade: number;
   responsesReceived: number;
   qualifiedOpportunities: number;

@@ -6,71 +6,81 @@ interface FunnelMetricsBarProps {
 }
 
 export const FunnelMetricsBar: React.FC<FunnelMetricsBarProps> = ({ metrics }) => {
-  const items: Array<{ label: string; value: number; sub: string }> = [
+  const items: Array<{ label: string; value: number | string; sub: string }> = [
     {
-      label: 'Negocios únicos encontrados',
+      label: 'Negocios analizados',
       value: metrics.uniqueBusinessesFound,
-      sub: 'Por Place ID en sesión',
+      sub: 'Únicos por Place ID',
     },
     {
-      label: 'Datos corroborados',
-      value: metrics.corroboratedRecords,
-      sub: 'Verificación independiente',
+      label: 'Descartados por fijo',
+      value: metrics.discardedLandlineCount,
+      sub: 'Solo teléfono fijo',
     },
     {
-      label: 'Oportunidad digital comprobable',
+      label: 'Sin móvil registrado',
+      value: metrics.noMobileCount,
+      sub: 'Requiere captura manual',
+    },
+    {
+      label: 'Oportunidades digitales',
       value: metrics.verifiableDigitalOpportunities,
-      sub: 'Brecha web confirmada',
+      sub: 'Brecha web comprobable',
+    },
+    {
+      label: 'Pend. corroboración',
+      value: metrics.pendingCorroborationCount,
+      sub: 'Por verificar manualmente',
+    },
+    {
+      label: 'Preseleccionados',
+      value: metrics.preselectedCount,
+      sub: 'En etapa PRESELECCIONADO',
+    },
+    {
+      label: 'Duplicados / excluidos',
+      value: metrics.duplicatesAndExcludedCount,
+      sub: 'Lista exclusión y descartes',
     },
     {
       label: 'Contactos autorizados',
-      value: metrics.authorizedContactsMade,
-      sub: 'Gestión manual directa',
+      value: metrics.authorizedContactsCount,
+      sub: 'Con base legal registrada',
     },
     {
-      label: 'Respuestas obtenidas',
-      value: metrics.responsesReceived,
-      sub: 'Interacción real',
-    },
-    {
-      label: 'Oportunidades calificadas',
-      value: metrics.qualifiedOpportunities,
-      sub: 'Interesado o Cotización',
-    },
-    {
-      label: 'Ventas confirmadas',
-      value: metrics.confirmedSales,
-      sub: 'Clientes cerrados',
+      label: 'Respuestas / ventas',
+      value: `${metrics.responsesReceived} / ${metrics.confirmedSales}`,
+      sub: 'Respuestas y clientes reales',
     },
   ];
 
   return (
     <section
-      aria-label="Métricas independientes del embudo comercial"
+      aria-label="Métricas independientes del cualificador y embudo comercial"
       className="bg-white border border-slate-200 rounded-xl p-4"
     >
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3 pb-2 border-b border-slate-100">
         <h2 className="text-sm font-semibold text-slate-800">
-          Métricas Independientes WEBNEX
+          Métricas del Cualificador y Embudo Comercial WEBNEX
         </h2>
         <span className="text-xs text-slate-500">
-          Conteos reales sin tasas de conversión estimadas ni mensajería masiva
+          Conteos reales sin tasas estimadas ni automatización de mensajería
         </span>
       </div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-9 gap-2.5">
         {items.map((item) => (
           <div
             key={item.label}
-            className="p-3 rounded-lg bg-slate-50 border border-slate-200/80 flex flex-col justify-between"
+            className="p-2.5 rounded-lg bg-slate-50 border border-slate-200/80 flex flex-col justify-between"
           >
-            <div className="text-xs font-medium text-slate-600 leading-snug">
+            <div className="text-[11px] font-medium text-slate-600 leading-snug">
               {item.label}
             </div>
-            <div className="mt-2">
-              <div className="text-2xl font-semibold text-slate-900 font-mono-tabular">
+            <div className="mt-1.5">
+              <div className="text-lg font-semibold text-slate-900 font-mono-tabular">
                 {item.value}
               </div>
-              <div className="text-[11px] text-slate-500 mt-0.5 truncate" title={item.sub}>
+              <div className="text-[10px] text-slate-500 mt-0.5 truncate" title={item.sub}>
                 {item.sub}
               </div>
             </div>

@@ -67,7 +67,7 @@
     },
     "FollowupLeadRecord": {
       "title": "FollowupLeadRecord",
-      "description": "Registro CRM comercial con datos verificados independientemente o capturados legítimamente por el usuario.",
+      "description": "Registro CRM comercial: guarda Place ID + metadatos permitidos o datos capturados independientemente por el usuario (nunca contenido exportable directo de Google Maps).",
       "type": "object",
       "properties": {
         "ownerUid": {
@@ -80,9 +80,12 @@
           "type": "string",
           "maxLength": 160
         },
+        "sourceKind": {
+          "type": "string",
+          "enum": ["places_preselection", "independent_manual"]
+        },
         "independentBusinessName": {
           "type": "string",
-          "minLength": 1,
           "maxLength": 160
         },
         "district": {
@@ -132,15 +135,28 @@
         "stage": {
           "type": "string",
           "enum": [
-            "Pendiente de revisión",
-            "Verificado independientemente",
-            "Contactado legalmente",
-            "Respondió",
-            "Interesado",
-            "Cotización",
-            "Cliente",
-            "Descartado"
+            "PRESELECCIONADO",
+            "PENDIENTE DE VERIFICACIÓN",
+            "CONTACTO AUTORIZADO",
+            "CONTACTADO",
+            "RESPONDIÓ",
+            "INTERESADO",
+            "COTIZACIÓN",
+            "CLIENTE",
+            "DESCARTADO"
           ]
+        },
+        "legalBasis": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "qualificationTier": {
+          "type": "string",
+          "enum": ["", "PRIORIDAD ALTA", "REVISIÓN PENDIENTE", "NO ELEGIBLE"]
+        },
+        "aiSummary": {
+          "type": "string",
+          "maxLength": 800
         },
         "notes": {
           "type": "string",
@@ -158,6 +174,7 @@
       "required": [
         "ownerUid",
         "placeId",
+        "sourceKind",
         "independentBusinessName",
         "district",
         "confirmedNoWebsite",
@@ -168,6 +185,9 @@
         "independentDigitalScore",
         "independentContactScore",
         "stage",
+        "legalBasis",
+        "qualificationTier",
+        "aiSummary",
         "notes",
         "createdAt",
         "updatedAt"
@@ -185,7 +205,7 @@
     },
     "/users/{userId}/followups/{followupId}": {
       "schema": { "$ref": "#/entities/FollowupLeadRecord" },
-      "description": "Seguimiento comercial independiente privado por UID autorizado."
+      "description": "Seguimiento comercial independiente y referencias Place ID privadas por UID autorizado."
     }
   }
 }

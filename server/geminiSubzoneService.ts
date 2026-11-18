@@ -3,6 +3,7 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 export interface SubzoneSuggestionResult {
   subzones: string[];
   rationale: string;
+  modelUsed?: string;
 }
 
 export class GeminiSubzoneError extends Error {
@@ -95,52 +96,95 @@ export async function suggestPeruvianSubzones(
     },
   });
 
-  const MAX_RETRIES = 2;
-  let lastErr: any;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Sugiere entre 4 y 6 subzonas, distritos o sectores comerciales reales dentro o colindantes a "${location}, Perú" para buscar "${businessType}" mediante Google Places API (New).
+  const promptContents = `Sugiere entre 4 y 6 subzonas, distritos o sectores comerciales reales dentro o colindantes a "${location}, Perú" para buscar "${businessType}" mediante Google Places API (New).
 REGLAS ESTRICTAS:
 - Devuelve ÚNICAMENTE nombres geográficos reales de distritos o zonas urbanas del Perú.
-- NUNCA menciones, inventes ni incluyas nombres de empresas, teléfonos, sitios web o reseñas.`,
-        config: {
-          systemInstruction:
-            'Eres un asistente geográfico especializado en zonificación urbana del Perú. Solo devuelves nombres de distritos y sectores reales en JSON.',
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              subzones: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: 'Lista de 4 a 6 subzonas o distritos reales en Perú.',
-              },
-              rationale: {
-                type: Type.STRING,
-                description: 'Breve explicación geográfica de por qué esas zonas ayudan a segmentar la búsqueda.',
-              },
-            },
-            required: ['subzones', 'rationale'],
-          },
-        },
-      });
+- NUNCA menciones, inventes ni incluyas nombres de empresas, teléfonos, sitios web o reseñas.`;
 
-      return parseSubzoneGeminiResponse(response.text);
+  const responseSchema = {
+    type: Type.OBJECT,
+    properties: {
+      subzones: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+        description: 'Lista de 4 a 6 subzonas o distritos reales en Perú.',
+      },
+      rationale: {
+        type: Type.STRING,
+        description: 'Breve explicación geográfica de por qué esas zonas ayudan a segmentar la búsqueda.',
+      },
+    },
+    required: ['subzones', 'rationale'],
+  };
+
+  const candidates: Array<{ model: string; useLowThinking: boolean; timeoutMs: number }> = [
+    { model: 'gemini-4-hydrogen', useLowThinking: true, timeoutMs: 7000 },
+    { model: 'gemini-3.1-flash-lite', useLowThinking: false, timeoutMs: 10000 },
+  ];
+
+  const withTimeout = async <T>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => {
+            const err: any = new Error(`Tiempo de espera agotado en ${label} (${ms}ms)`);
+            err.status = 504;
+            err.code = 'GEMINI_TIMEOUT';
+            reject(err);
+          }, ms);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  let lastErr: any;
+
+  for (const candidate of candidates) {
+    try {
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model: candidate.model,
+          contents: promptContents,
+          config: {
+            systemInstruction:
+              'Eres un asistente geográfico especializado en zonificación urbana del Perú. Solo devuelves nombres de distritos y sectores reales en JSON.',
+            ...(candidate.useLowThinking
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : {}),
+            responseMimeType: 'application/json',
+            responseSchema,
+          },
+        }),
+        candidate.timeoutMs,
+        candidate.model
+      );
+
+      const parsed = parseSubzoneGeminiResponse(response.text);
+      return {
+        ...parsed,
+        modelUsed: candidate.model,
+      };
     } catch (err: any) {
       if (err instanceof GeminiSubzoneError) throw err;
       lastErr = err;
       const status = err?.status || err?.statusCode || 500;
       const msg = String(err?.message || '');
-      const isTransient503 = status === 503 || msg.includes('UNAVAILABLE') || msg.includes('high demand');
-      if (isTransient503 && attempt < MAX_RETRIES) {
-        await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
-        continue;
+      const shouldTryFallback =
+        status === 503 ||
+        status === 504 ||
+        status === 429 ||
+        status === 404 ||
+        msg.includes('UNAVAILABLE') ||
+        msg.includes('high demand') ||
+        msg.includes('RESOURCE_EXHAUSTED') ||
+        msg.includes('GEMINI_TIMEOUT');
+      if (!shouldTryFallback) {
+        break;
       }
-      break;
     }
   }
 

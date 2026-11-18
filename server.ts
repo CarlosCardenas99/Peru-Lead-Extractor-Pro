@@ -3,9 +3,11 @@ import path from 'node:path';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { DailyQuotaGuard } from './server/quotaGuard';
-import { PlacesApiError, searchPlacesNewApi } from './server/placesService';
+import { getPlaceDetailsById, PlacesApiError, searchPlacesNewApi } from './server/placesService';
 import { verifyWebsiteIndependently } from './server/websiteVerifier';
 import { GeminiSubzoneError, suggestPeruvianSubzones } from './server/geminiSubzoneService';
+import { extractWebsiteMetadataSafe } from './server/websiteMetadataExtractor';
+import { analyzeCandidatesWithGemini, GeminiAnalystError } from './server/geminiAnalystService';
 
 function loadEnvFileIfPresent(filename: string) {
   const filePath = path.resolve(process.cwd(), filename);
@@ -35,23 +37,23 @@ export function createApiApp() {
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/api/health', (_req, res) => {
-    const hasMapsKey = Boolean(process.env.GOOGLE_MAPS_API_KEY || process.env.VITE_GOOGLE_MAPS_API_KEY);
+    const keyPresence = {
+      GOOGLE_MAPS_PLATFORM_KEY: Boolean(process.env.GOOGLE_MAPS_PLATFORM_KEY),
+      GOOGLE_MAPS_API_KEY: Boolean(process.env.GOOGLE_MAPS_API_KEY),
+      VITE_GOOGLE_MAPS_API_KEY: Boolean(process.env.VITE_GOOGLE_MAPS_API_KEY),
+    };
+    const hasMapsKey =
+      keyPresence.GOOGLE_MAPS_PLATFORM_KEY ||
+      keyPresence.GOOGLE_MAPS_API_KEY ||
+      keyPresence.VITE_GOOGLE_MAPS_API_KEY;
     const hasGeminiKey = Boolean(process.env.GEMINI_API_KEY);
     res.json({
       ok: true,
       hasMapsKey,
+      keyPresence,
       hasGeminiKey,
       quota: quotaGuard.getStatus(),
     });
-  });
-
-  app.get('/api/maps-config', (_req, res) => {
-    const mapsApiKey = (
-      process.env.VITE_GOOGLE_MAPS_API_KEY ||
-      process.env.GOOGLE_MAPS_API_KEY ||
-      ''
-    ).trim();
-    res.json({ mapsApiKey });
   });
 
   app.get('/api/quota', (_req, res) => {
@@ -74,7 +76,8 @@ export function createApiApp() {
         });
       }
 
-      const fullLocation = subzone ? `${subzone}, ${location}, Perú` : `${location}, Perú`;
+      const baseLocation = /per[uú]\s*$/i.test(location) ? location : `${location}, Perú`;
+      const fullLocation = subzone ? `${subzone}, ${baseLocation}` : baseLocation;
       const textQuery = `${businessType} en ${fullLocation}`;
       const cacheKey = `places:${textQuery.toLowerCase()}:${pageToken || 'first'}`;
 
@@ -89,7 +92,9 @@ export function createApiApp() {
       }
 
       const hasMapsKey = Boolean(
-        process.env.GOOGLE_MAPS_API_KEY || process.env.VITE_GOOGLE_MAPS_API_KEY
+        process.env.GOOGLE_MAPS_PLATFORM_KEY ||
+          process.env.GOOGLE_MAPS_API_KEY ||
+          process.env.VITE_GOOGLE_MAPS_API_KEY
       );
       if (!hasMapsKey) {
         return res.status(503).json({
@@ -216,6 +221,149 @@ export function createApiApp() {
       return res.status(500).json({
         code: 'GEMINI_INTERNAL_ERROR',
         message: err?.message || 'Error inesperado al sugerir subzonas.',
+        quota: quotaGuard.getStatus(),
+      });
+    }
+  });
+
+  app.post('/api/analyze-leads', async (req, res) => {
+    try {
+      const rawItems = Array.isArray(req.body?.candidates) ? req.body.candidates.slice(0, 8) : [];
+      if (rawItems.length === 0) {
+        return res.json({
+          analyses: [],
+          modelUsed: 'none',
+          warning: null,
+          quota: quotaGuard.getStatus(),
+        });
+      }
+
+      if (!process.env.GEMINI_API_KEY) {
+        return res.json({
+          analyses: [],
+          modelUsed: 'none',
+          warning: 'GEMINI_API_KEY no configurada; se aplicó únicamente evaluación determinística.',
+          quota: quotaGuard.getStatus(),
+        });
+      }
+
+      if (!quotaGuard.canUseGemini()) {
+        return res.status(429).json({
+          code: 'LOCAL_GEMINI_QUOTA_REACHED',
+          message: 'Cuota diaria preventiva de Gemini alcanzada; continúa usando la evaluación determinística.',
+          quota: quotaGuard.getStatus(),
+        });
+      }
+
+      // Extrae metadatos HTML públicos (con protección SSRF y sin PII) solo de webs oficiales válidas
+      const prepared = await Promise.all(
+        rawItems.map(async (item: any) => {
+          const placeId = String(item?.placeId || '').trim();
+          const category = String(item?.category || 'Comercio').trim();
+          const websiteStatus = item?.websiteStatus || 'unregistered';
+          const userNotes = String(item?.userNotes || '').trim();
+          const officialWebsiteUrl =
+            typeof item?.officialWebsiteUrl === 'string' ? item.officialWebsiteUrl.trim() : '';
+
+          let websiteMeta = null;
+          if (
+            officialWebsiteUrl &&
+            (websiteStatus === 'active_https' ||
+              websiteStatus === 'active_http' ||
+              websiteStatus === 'unverified_inconclusive')
+          ) {
+            const metaCacheKey = `webmeta:${officialWebsiteUrl.toLowerCase()}`;
+            websiteMeta = quotaGuard.getCached<any>(metaCacheKey);
+            if (!websiteMeta) {
+              websiteMeta = await extractWebsiteMetadataSafe(officialWebsiteUrl);
+              quotaGuard.setCached(metaCacheKey, websiteMeta);
+            }
+          }
+
+          return {
+            placeId,
+            category,
+            websiteStatus,
+            userNotes,
+            websiteMeta,
+          };
+        })
+      );
+
+      quotaGuard.consumeGemini();
+      const result = await analyzeCandidatesWithGemini(prepared);
+
+      return res.json({
+        analyses: result.analyses,
+        modelUsed: result.modelUsed,
+        warning: null,
+        quota: quotaGuard.getStatus(),
+      });
+    } catch (err: any) {
+      if (err instanceof GeminiAnalystError) {
+        return res.status(err.status).json({
+          code: err.code,
+          message: err.message,
+          analyses: [],
+          quota: quotaGuard.getStatus(),
+        });
+      }
+      return res.status(500).json({
+        code: 'GEMINI_ANALYST_INTERNAL',
+        message: err?.message || 'Error inesperado analizando candidatos con Gemini.',
+        analyses: [],
+        quota: quotaGuard.getStatus(),
+      });
+    }
+  });
+
+  app.post('/api/places/details', async (req, res) => {
+    try {
+      const rawIds: unknown[] = Array.isArray(req.body?.placeIds) ? req.body.placeIds : [];
+      const uniqueIds: string[] = Array.from(
+        new Set(
+          rawIds
+            .filter((id): id is string => typeof id === 'string')
+            .map((id) => id.trim())
+            .filter((id) => /^[a-zA-Z0-9_-]+$/.test(id) && !id.startsWith('manual_'))
+        )
+      ).slice(0, 10);
+
+      if (uniqueIds.length === 0) {
+        return res.json({ details: {}, quota: quotaGuard.getStatus() });
+      }
+
+      const details: Record<string, unknown> = {};
+      for (const placeId of uniqueIds) {
+        const cacheKey = `placedetails:${placeId}`;
+        const cached = quotaGuard.getCached(cacheKey);
+        if (cached) {
+          details[placeId] = cached;
+          continue;
+        }
+        if (!quotaGuard.canUsePlaces()) {
+          break;
+        }
+        quotaGuard.consumePlaces();
+        const fetched = await getPlaceDetailsById(placeId);
+        if (fetched) {
+          quotaGuard.setCached(cacheKey, fetched);
+          details[placeId] = fetched;
+        }
+      }
+
+      return res.json({ details, quota: quotaGuard.getStatus() });
+    } catch (err: any) {
+      if (err instanceof PlacesApiError) {
+        return res.status(err.status).json({
+          code: err.code,
+          message: err.message,
+          quota: quotaGuard.getStatus(),
+        });
+      }
+      return res.status(500).json({
+        code: 'PLACE_DETAILS_INTERNAL_ERROR',
+        message: err?.message || 'Error al hidratar detalles desde Places API.',
         quota: quotaGuard.getStatus(),
       });
     }

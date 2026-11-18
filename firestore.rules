@@ -75,21 +75,38 @@ service cloud.firestore {
 
     function isValidFollowupStage(stage) {
       return stage in [
-        'Pendiente de revisión',
-        'Verificado independientemente',
-        'Contactado legalmente',
-        'Respondió',
-        'Interesado',
-        'Cotización',
-        'Cliente',
-        'Descartado'
+        'PRESELECCIONADO',
+        'PENDIENTE DE VERIFICACIÓN',
+        'CONTACTO AUTORIZADO',
+        'CONTACTADO',
+        'RESPONDIÓ',
+        'INTERESADO',
+        'COTIZACIÓN',
+        'CLIENTE',
+        'DESCARTADO'
       ];
+    }
+
+    function requiresLegalBasis(stage) {
+      return stage in [
+        'CONTACTO AUTORIZADO',
+        'CONTACTADO',
+        'RESPONDIÓ',
+        'INTERESADO',
+        'COTIZACIÓN',
+        'CLIENTE'
+      ];
+    }
+
+    function isValidQualificationTier(tier) {
+      return tier in ['', 'PRIORIDAD ALTA', 'REVISIÓN PENDIENTE', 'NO ELEGIBLE'];
     }
 
     function isValidFollowup(data, userId) {
       return data.keys().hasAll([
           'ownerUid',
           'placeId',
+          'sourceKind',
           'independentBusinessName',
           'district',
           'confirmedNoWebsite',
@@ -100,6 +117,9 @@ service cloud.firestore {
           'independentDigitalScore',
           'independentContactScore',
           'stage',
+          'legalBasis',
+          'qualificationTier',
+          'aiSummary',
           'notes',
           'createdAt',
           'updatedAt'
@@ -107,6 +127,7 @@ service cloud.firestore {
         data.keys().hasOnly([
           'ownerUid',
           'placeId',
+          'sourceKind',
           'independentBusinessName',
           'district',
           'confirmedNoWebsite',
@@ -117,13 +138,18 @@ service cloud.firestore {
           'independentDigitalScore',
           'independentContactScore',
           'stage',
+          'legalBasis',
+          'qualificationTier',
+          'aiSummary',
           'notes',
           'createdAt',
           'updatedAt'
         ]) &&
         data.ownerUid is string && data.ownerUid == userId &&
-        data.placeId is string && data.placeId.size() <= 160 &&
-        data.independentBusinessName is string && data.independentBusinessName.size() >= 1 && data.independentBusinessName.size() <= 160 &&
+        data.placeId is string && data.placeId.size() >= 1 && data.placeId.size() <= 160 &&
+        data.sourceKind in ['places_preselection', 'independent_manual'] &&
+        data.independentBusinessName is string && data.independentBusinessName.size() <= 160 &&
+        (data.sourceKind == 'places_preselection' || data.independentBusinessName.size() >= 1) &&
         data.district is string && data.district.size() <= 120 &&
         data.confirmedNoWebsite is bool &&
         data.independentWebsiteStatus is string && isValidWebsiteStatus(data.independentWebsiteStatus) &&
@@ -133,6 +159,10 @@ service cloud.firestore {
         data.independentDigitalScore is number && data.independentDigitalScore >= 0 && data.independentDigitalScore <= 100 &&
         data.independentContactScore is number && data.independentContactScore >= 0 && data.independentContactScore <= 100 &&
         data.stage is string && isValidFollowupStage(data.stage) &&
+        data.legalBasis is string && data.legalBasis.size() <= 300 &&
+        (!requiresLegalBasis(data.stage) || data.legalBasis.size() >= 8) &&
+        data.qualificationTier is string && isValidQualificationTier(data.qualificationTier) &&
+        data.aiSummary is string && data.aiSummary.size() <= 800 &&
         data.notes is string && data.notes.size() <= 1000 &&
         data.createdAt is timestamp &&
         data.updatedAt == request.time;
@@ -164,9 +194,10 @@ service cloud.firestore {
         isValidFollowup(incoming(), userId) &&
         incoming().ownerUid == existing().ownerUid &&
         incoming().createdAt == existing().createdAt &&
-        incoming().placeId == existing().placeId && (
-          // Action 1: Active pipeline stage, independent verification, or contact update
-          (existing().stage != 'Cliente' &&
+        incoming().placeId == existing().placeId &&
+        incoming().sourceKind == existing().sourceKind && (
+          // Action 1: Active pipeline stage, legalBasis, independent verification, or contact update
+          (existing().stage != 'CLIENTE' &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'independentBusinessName',
               'district',
@@ -178,12 +209,15 @@ service cloud.firestore {
               'independentDigitalScore',
               'independentContactScore',
               'stage',
+              'legalBasis',
+              'qualificationTier',
+              'aiSummary',
               'notes',
               'updatedAt'
             ])) ||
           // Action 2: Client stage locked; only notes & timestamp editable
-          (existing().stage == 'Cliente' &&
-            incoming().stage == 'Cliente' &&
+          (existing().stage == 'CLIENTE' &&
+            incoming().stage == 'CLIENTE' &&
             incoming().diff(existing()).affectedKeys().hasOnly(['notes', 'updatedAt']))
         );
       allow delete: if isOwner(userId) && isValidId(followupId) && existing().ownerUid == request.auth.uid;

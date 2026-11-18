@@ -1,16 +1,19 @@
 import React, { useMemo, useState } from 'react';
-import { Trash2, Upload } from 'lucide-react';
+import { CheckCircle2, ShieldCheck, Trash2, Upload } from 'lucide-react';
 import { ExclusionRecord } from '../types';
 import {
   ExclusionBatchParseResult,
   parseExclusionBatchInput,
 } from '../utils/exclusionUtils';
+import type { FirestorePreflightResult } from '../services/firebaseService';
 
 interface ExclusionManagerViewProps {
   isSignedIn: boolean;
+  userEmail?: string;
   exclusions: ExclusionRecord[];
   exclusionKeys: Set<string>;
   onSignIn: () => void;
+  onVerifyFirestoreAccess: () => Promise<FirestorePreflightResult>;
   onImportBatch: (
     candidates: ExclusionBatchParseResult['uniqueEntries'],
     sourceLabel: string,
@@ -21,9 +24,11 @@ interface ExclusionManagerViewProps {
 
 export const ExclusionManagerView: React.FC<ExclusionManagerViewProps> = ({
   isSignedIn,
+  userEmail,
   exclusions,
   exclusionKeys,
   onSignIn,
+  onVerifyFirestoreAccess,
   onImportBatch,
   onDeleteExclusion,
 }) => {
@@ -34,6 +39,8 @@ export const ExclusionManagerView: React.FC<ExclusionManagerViewProps> = ({
   const [progressText, setProgressText] = useState('');
   const [searchFilter, setSearchFilter] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [isVerifyingDb, setIsVerifyingDb] = useState(false);
+  const [dbVerification, setDbVerification] = useState<FirestorePreflightResult | null>(null);
 
   const visibleExclusions = useMemo(() => {
     const q = searchFilter.trim().toLowerCase();
@@ -83,11 +90,34 @@ export const ExclusionManagerView: React.FC<ExclusionManagerViewProps> = ({
     handleAnalyze(text);
   };
 
+  const handleVerifyDb = async (): Promise<boolean> => {
+    setIsVerifyingDb(true);
+    setErrorMsg(null);
+    try {
+      const result = await onVerifyFirestoreAccess();
+      setDbVerification(result);
+      return result.ok && result.writeVerified && result.readVerified;
+    } catch (err: any) {
+      setDbVerification(null);
+      setErrorMsg(err?.message || 'No se pudo verificar escritura y lectura en Firestore.');
+      return false;
+    } finally {
+      setIsVerifyingDb(false);
+    }
+  };
+
   const handleConfirmImport = async () => {
     if (!preview || preview.uniqueEntries.length === 0) return;
     setImporting(true);
     setErrorMsg(null);
     try {
+      if (!dbVerification?.ok) {
+        const verified = await handleVerifyDb();
+        if (!verified) {
+          setImporting(false);
+          return;
+        }
+      }
       const saved = await onImportBatch(
         preview.uniqueEntries,
         sourceLabel.trim() || 'Importación WEBNEX',
@@ -108,14 +138,38 @@ export const ExclusionManagerView: React.FC<ExclusionManagerViewProps> = ({
   return (
     <div className="space-y-4">
       <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
-        <div>
-          <h2 className="text-base font-semibold text-slate-900">
-            Importador Seguro de Listas de Exclusión WEBNEX
-          </h2>
-          <p className="text-xs text-slate-600 mt-1">
-            Esta lista inicia vacía hasta que proporciones tus archivos o registros propios (ej. lista histórica WEBNEX de 4,767 descartados). Normaliza automáticamente teléfonos peruanos (+51), dominios web y Place IDs, evitando duplicados.
-          </p>
+        <div className="flex flex-col md:flex-row md:items-start justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold text-slate-900">
+              Importador Seguro de Listas de Exclusión WEBNEX
+            </h2>
+            <p className="text-xs text-slate-600 mt-1">
+              Esta lista inicia vacía hasta que proporciones tus archivos o registros propios (ej. lista histórica WEBNEX de 4,767 descartados). Normaliza automáticamente teléfonos peruanos (+51), dominios web y Place IDs, evitando duplicados.
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={isVerifyingDb || importing}
+            onClick={handleVerifyDb}
+            className="px-3 py-2 text-xs font-semibold border border-purple-300 bg-purple-50 text-purple-900 rounded-lg hover:bg-purple-100 disabled:opacity-50 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+          >
+            <ShieldCheck className="w-4 h-4 text-purple-700" />
+            {isVerifyingDb ? 'Probando Firestore...' : 'Probar escritura y lectura Firestore'}
+          </button>
         </div>
+
+        {dbVerification && (
+          <div className="text-xs bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-lg px-3 py-2 flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+            <span>{dbVerification.message}</span>
+          </div>
+        )}
+
+        {!dbVerification && (
+          <div className="text-xs bg-slate-50 border border-slate-200 text-slate-700 rounded-lg px-3 py-2">
+            Sesión Google activa ({userEmail || 'correo verificado'}). Antes de importar listas masivas se ejecutará una prueba mínima de escritura y lectura en tu colección privada de Firestore.
+          </div>
+        )}
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>

@@ -1,11 +1,16 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { ExternalLink, RefreshCw, ShieldCheck } from 'lucide-react';
 import {
+  AUTHORIZED_OUTREACH_STAGES,
   FOLLOWUP_STAGES,
   FollowupLeadRecord,
   FollowupStage,
+  HydratedPlaceDetails,
   PhoneVerificationStage,
 } from '../types';
 import { getPhoneStageLabel } from '../utils/peruPhone';
+import { validateLegalBasisForStage } from '../utils/leadQualifier';
+import { fetchPlaceDetailsBatch } from '../services/geminiService';
 import { ExportButton } from './ExportButton';
 
 interface FollowupCrmViewProps {
@@ -17,9 +22,18 @@ interface FollowupCrmViewProps {
     updates: Partial<
       Pick<
         FollowupLeadRecord,
-        'stage' | 'phoneStage' | 'independentPhone' | 'independentEmail' | 'notes' | 'confirmedNoWebsite'
+        | 'independentBusinessName'
+        | 'district'
+        | 'stage'
+        | 'legalBasis'
+        | 'phoneStage'
+        | 'independentPhone'
+        | 'independentEmail'
+        | 'notes'
+        | 'confirmedNoWebsite'
       >
-    >
+    >,
+    currentRecord?: FollowupLeadRecord
   ) => Promise<void>;
   onCreateManualFollowup: (payload: {
     independentBusinessName: string;
@@ -28,6 +42,7 @@ interface FollowupCrmViewProps {
     independentPhone: string;
     phoneStage: PhoneVerificationStage;
     independentEmail: string;
+    legalBasis: string;
     notes: string;
   }) => Promise<void>;
 }
@@ -42,11 +57,22 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
   const [stageFilter, setStageFilter] = useState<'all' | FollowupStage>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [draftNotes, setDraftNotes] = useState('');
+  const [draftName, setDraftName] = useState('');
+  const [draftDistrict, setDraftDistrict] = useState('');
   const [draftPhone, setDraftPhone] = useState('');
   const [draftEmail, setDraftEmail] = useState('');
-  const [showManualForm, setShowManualForm] = useState(false);
+  const [draftLegalBasis, setDraftLegalBasis] = useState('');
+  const [draftNotes, setDraftNotes] = useState('');
 
+  // Pending authorization prompt when user selects CONTACTO AUTORIZADO / CONTACTADO without legalBasis
+  const [authPrompt, setAuthPrompt] = useState<{
+    record: FollowupLeadRecord;
+    targetStage: FollowupStage;
+    legalBasisInput: string;
+    error: string | null;
+  } | null>(null);
+
+  const [showManualForm, setShowManualForm] = useState(false);
   const [manualName, setManualName] = useState('');
   const [manualDistrict, setManualDistrict] = useState('');
   const [manualPhone, setManualPhone] = useState('');
@@ -54,19 +80,60 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
   const [manualConfirmedNoWeb, setManualConfirmedNoWeb] = useState(true);
   const [manualNotes, setManualNotes] = useState('');
 
+  // Live session-only Place Details hydration (never stored in Firestore or exported to CSV)
+  const [hydratedPlaces, setHydratedPlaces] = useState<Record<string, HydratedPlaceDetails>>({});
+  const [isHydrating, setIsHydrating] = useState(false);
+
+  const missingPlaceIdsToHydrate = useMemo(
+    () =>
+      followups
+        .filter(
+          (f) =>
+            f.placeId &&
+            !f.placeId.startsWith('manual_') &&
+            !hydratedPlaces[f.placeId]
+        )
+        .map((f) => f.placeId)
+        .slice(0, 10),
+    [followups, hydratedPlaces]
+  );
+
+  const handleHydrateVisiblePlaces = async () => {
+    if (missingPlaceIdsToHydrate.length === 0) return;
+    setIsHydrating(true);
+    try {
+      const res = await fetchPlaceDetailsBatch(missingPlaceIdsToHydrate);
+      if (Object.keys(res.details).length > 0) {
+        setHydratedPlaces((prev) => ({ ...prev, ...res.details }));
+      }
+    } finally {
+      setIsHydrating(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isSignedIn && missingPlaceIdsToHydrate.length > 0 && !isHydrating) {
+      handleHydrateVisiblePlaces();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSignedIn, missingPlaceIdsToHydrate.length]);
+
   const filtered = useMemo(() => {
     const q = searchTerm.trim().toLowerCase();
     return followups.filter((item) => {
       if (stageFilter !== 'all' && item.stage !== stageFilter) return false;
       if (!q) return true;
+      const hydrated = hydratedPlaces[item.placeId];
       return (
         item.independentBusinessName.toLowerCase().includes(q) ||
         item.district.toLowerCase().includes(q) ||
         item.independentPhone.toLowerCase().includes(q) ||
-        item.notes.toLowerCase().includes(q)
+        item.placeId.toLowerCase().includes(q) ||
+        item.notes.toLowerCase().includes(q) ||
+        (hydrated?.displayName || '').toLowerCase().includes(q)
       );
     });
-  }, [followups, stageFilter, searchTerm]);
+  }, [followups, stageFilter, searchTerm, hydratedPlaces]);
 
   if (!isSignedIn) {
     return (
@@ -75,7 +142,7 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
           Seguimiento Comercial Privado (Firebase Firestore)
         </h2>
         <p className="text-sm text-slate-600 mt-2 max-w-lg mx-auto">
-          Inicia sesión con Google para gestionar tus prospectos verificados independientemente bajo reglas estrictas por UID autorizado. No se permite acceso público a registros comerciales.
+          Inicia sesión con Google para gestionar tus prospectos preseleccionados y registros independientes bajo reglas estrictas por UID autorizado. No se permite acceso público.
         </p>
         <button
           type="button"
@@ -98,6 +165,7 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
       independentPhone: manualPhone.trim(),
       phoneStage: manualPhone.trim() ? 'independently_corroborated' : 'none',
       independentEmail: manualEmail.trim(),
+      legalBasis: '',
       notes: manualNotes.trim(),
     });
     setManualName('');
@@ -108,18 +176,45 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
     setShowManualForm(false);
   };
 
+  const handleStageChange = async (item: FollowupLeadRecord, nextStage: FollowupStage) => {
+    if (AUTHORIZED_OUTREACH_STAGES.has(nextStage)) {
+      const gateError = validateLegalBasisForStage(nextStage, item.legalBasis);
+      if (gateError) {
+        setAuthPrompt({
+          record: item,
+          targetStage: nextStage,
+          legalBasisInput: item.legalBasis || '',
+          error: null,
+        });
+        return;
+      }
+    }
+    await onUpdateFollowup(item.id, { stage: nextStage }, item);
+  };
+
   return (
     <div className="space-y-4">
       <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h2 className="text-base font-semibold text-slate-900">
-            Módulo de Seguimiento Comercial (Datos Independientes)
+            Módulo de Seguimiento Comercial (9 Etapas y Base Legal Verificada)
           </h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Almacena únicamente datos recopilados independientemente y capturados por el usuario. Sin mensajería masiva automática.
+            Los registros preseleccionados guardan únicamente Place ID y metadatos propios; los detalles de Maps se muestran en vivo solo en sesión y nunca se exportan.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          {missingPlaceIdsToHydrate.length > 0 && (
+            <button
+              type="button"
+              disabled={isHydrating}
+              onClick={handleHydrateVisiblePlaces}
+              className="px-3 py-2 text-xs font-medium border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1.5"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isHydrating ? 'animate-spin' : ''}`} />
+              Hidratar Places ({missingPlaceIdsToHydrate.length})
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setShowManualForm((v) => !v)}
@@ -130,6 +225,68 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
           <ExportButton followups={filtered} />
         </div>
       </div>
+
+      {authPrompt && (
+        <div className="bg-amber-50 border border-amber-300 rounded-xl p-4 space-y-3">
+          <div className="flex items-start gap-2">
+            <ShieldCheck className="w-4 h-4 text-amber-800 mt-0.5 shrink-0" />
+            <div className="text-xs text-amber-950">
+              <div className="font-semibold">
+                Autorización de Contacto Requerida para pasar a &ldquo;{authPrompt.targetStage}&rdquo;
+              </div>
+              <p className="mt-0.5">
+                La preselección automática NO autoriza llamadas ni mensajes comerciales. Registra la evidencia verificable de consentimiento previo o base legal aplicable antes de autorizar el contacto.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <input
+              type="text"
+              value={authPrompt.legalBasisInput}
+              onChange={(e) =>
+                setAuthPrompt({ ...authPrompt, legalBasisInput: e.target.value, error: null })
+              }
+              placeholder="Ej: Solicitud recibida por formulario web / Referido directo B2B verificado (mín. 8 caracteres)"
+              className="flex-1 px-3 py-2 text-xs border border-amber-300 rounded-lg bg-white"
+            />
+            <button
+              type="button"
+              onClick={async () => {
+                const err = validateLegalBasisForStage(
+                  authPrompt.targetStage,
+                  authPrompt.legalBasisInput
+                );
+                if (err) {
+                  setAuthPrompt({ ...authPrompt, error: err });
+                  return;
+                }
+                await onUpdateFollowup(
+                  authPrompt.record.id,
+                  {
+                    stage: authPrompt.targetStage,
+                    legalBasis: authPrompt.legalBasisInput.trim(),
+                  },
+                  authPrompt.record
+                );
+                setAuthPrompt(null);
+              }}
+              className="px-4 py-2 text-xs font-semibold bg-purple-700 text-white rounded-lg hover:bg-purple-800 whitespace-nowrap"
+            >
+              Autorizar y actualizar etapa
+            </button>
+            <button
+              type="button"
+              onClick={() => setAuthPrompt(null)}
+              className="px-3 py-2 text-xs border border-slate-300 bg-white rounded-lg"
+            >
+              Cancelar
+            </button>
+          </div>
+          {authPrompt.error && (
+            <div className="text-xs text-red-700 font-medium">{authPrompt.error}</div>
+          )}
+        </div>
+      )}
 
       {showManualForm && (
         <form
@@ -246,43 +403,70 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
           type="text"
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          placeholder="Filtrar seguimiento por nombre, distrito, teléfono o notas..."
+          placeholder="Filtrar seguimiento por nombre, Place ID, distrito, teléfono o notas..."
           className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg"
         />
       </div>
 
       {filtered.length === 0 ? (
         <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-sm text-slate-500">
-          No hay registros de seguimiento para el filtro seleccionado. Selecciona un negocio en el Explorador y usa &ldquo;Guardar en Seguimiento CRM&rdquo;.
+          No hay registros de seguimiento para el filtro seleccionado. Usa &ldquo;Analizar y preseleccionar para seguimiento&rdquo; en el Explorador o agrega un registro independiente.
         </div>
       ) : (
         <div className="bg-white border border-slate-200 rounded-xl overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-700">
               <tr>
-                <th className="py-3 px-4">Empresa / Distrito</th>
-                <th className="py-3 px-3">Estado Comercial (8 etapas)</th>
-                <th className="py-3 px-3">Contacto Independiente</th>
-                <th className="py-3 px-3 text-right">Puntajes Indep.</th>
+                <th className="py-3 px-4">Empresa / Referencia Place ID</th>
+                <th className="py-3 px-3">Estado Comercial (9 etapas)</th>
+                <th className="py-3 px-3">Contacto Independiente y Autorización</th>
+                <th className="py-3 px-3 text-right">Puntajes</th>
                 <th className="py-3 px-4">Notas y Gestión</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 text-xs">
               {filtered.map((item) => {
                 const isEditing = editingId === item.id;
-                const isClientLocked = item.stage === 'Cliente';
+                const isClientLocked = item.stage === 'CLIENTE';
+                const hydrated = hydratedPlaces[item.placeId];
+                const displayName =
+                  item.independentBusinessName ||
+                  hydrated?.displayName ||
+                  `Place ID: ${item.placeId}`;
+                const displaySub = item.independentBusinessName
+                  ? item.district || 'Registro independiente'
+                  : hydrated
+                  ? `${hydrated.formattedAddress} (Ref. Places en vivo · No exportable)`
+                  : 'Solo Place ID persistido (clic en Hidratar Places)';
+
                 return (
                   <tr key={item.id} className="hover:bg-slate-50 align-top">
-                    <td className="py-3 px-4">
-                      <div className="font-semibold text-slate-900">
-                        {item.independentBusinessName}
+                    <td className="py-3 px-4 max-w-[260px]">
+                      <div className="font-semibold text-slate-900">{displayName}</div>
+                      <div className="text-slate-500 mt-0.5 text-[11px]">{displaySub}</div>
+                      <div className="text-[11px] text-slate-500 mt-1 flex flex-wrap items-center gap-2">
+                        <span>
+                          {item.confirmedNoWebsite
+                            ? 'Confirmado sin web'
+                            : `Web: ${item.independentWebsiteStatus}`}
+                        </span>
+                        {item.qualificationTier && (
+                          <span className="font-semibold text-purple-800">
+                            · {item.qualificationTier}
+                          </span>
+                        )}
                       </div>
-                      <div className="text-slate-500 mt-0.5">{item.district || 'Perú'}</div>
-                      <div className="text-[11px] text-slate-500 mt-1">
-                        {item.confirmedNoWebsite
-                          ? 'Confirmado sin web'
-                          : `Estado web: ${item.independentWebsiteStatus}`}
-                      </div>
+                      {hydrated?.googleMapsUri && (
+                        <a
+                          href={hydrated.googleMapsUri}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-[11px] text-purple-700 hover:underline mt-1"
+                        >
+                          Ver en Google Maps
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )}
                     </td>
 
                     <td className="py-3 px-3">
@@ -290,9 +474,7 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
                         value={item.stage}
                         disabled={isClientLocked}
                         onChange={(e) =>
-                          onUpdateFollowup(item.id, {
-                            stage: e.target.value as FollowupStage,
-                          })
+                          handleStageChange(item, e.target.value as FollowupStage)
                         }
                         className="px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg bg-white disabled:bg-slate-100"
                       >
@@ -304,7 +486,7 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
                       </select>
                       {isClientLocked && (
                         <div className="text-[10px] text-emerald-700 mt-1">
-                          Cliente confirmado (etapa bloqueada)
+                          CLIENTE confirmado (etapa bloqueada)
                         </div>
                       )}
                     </td>
@@ -314,23 +496,47 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
                         <div className="space-y-1.5">
                           <input
                             type="text"
+                            value={draftName}
+                            onChange={(e) => setDraftName(e.target.value)}
+                            placeholder="Nombre comercial independiente"
+                            className="w-full px-2 py-1 border border-slate-300 rounded text-xs"
+                          />
+                          <input
+                            type="text"
+                            value={draftDistrict}
+                            onChange={(e) => setDraftDistrict(e.target.value)}
+                            placeholder="Distrito independiente"
+                            className="w-full px-2 py-1 border border-slate-300 rounded text-xs"
+                          />
+                          <input
+                            type="text"
                             value={draftPhone}
                             onChange={(e) => setDraftPhone(e.target.value)}
-                            placeholder="Teléfono"
+                            placeholder="Teléfono corroborado"
                             className="w-full px-2 py-1 border border-slate-300 rounded text-xs font-mono-tabular"
                           />
                           <input
                             type="email"
                             value={draftEmail}
                             onChange={(e) => setDraftEmail(e.target.value)}
-                            placeholder="Correo"
+                            placeholder="Correo independiente"
+                            className="w-full px-2 py-1 border border-slate-300 rounded text-xs"
+                          />
+                          <input
+                            type="text"
+                            value={draftLegalBasis}
+                            onChange={(e) => setDraftLegalBasis(e.target.value)}
+                            placeholder="Base legal / evidencia consentimiento"
                             className="w-full px-2 py-1 border border-slate-300 rounded text-xs"
                           />
                         </div>
                       ) : (
                         <div>
                           <div className="font-mono-tabular text-slate-900">
-                            {item.independentPhone || 'Sin teléfono'}
+                            {item.independentPhone ||
+                              (hydrated?.nationalPhoneNumber
+                                ? `Ref. Places: ${hydrated.nationalPhoneNumber}`
+                                : 'Sin teléfono independiente')}
                           </div>
                           <div className="text-[11px] text-slate-500">
                             {getPhoneStageLabel(item.phoneStage)}
@@ -340,6 +546,16 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
                               {item.independentEmail}
                             </div>
                           )}
+                          <div className="text-[11px] mt-1 text-slate-600">
+                            Base legal:{' '}
+                            {item.legalBasis ? (
+                              <span className="text-emerald-800 font-medium">
+                                {item.legalBasis}
+                              </span>
+                            ) : (
+                              <span className="text-amber-700">Sin autorización aún</span>
+                            )}
+                          </div>
                         </div>
                       )}
                     </td>
@@ -371,10 +587,14 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
                                   isClientLocked
                                     ? { notes: draftNotes }
                                     : {
+                                        independentBusinessName: draftName,
+                                        district: draftDistrict,
                                         notes: draftNotes,
                                         independentPhone: draftPhone,
                                         independentEmail: draftEmail,
-                                      }
+                                        legalBasis: draftLegalBasis,
+                                      },
+                                  item
                                 );
                                 setEditingId(null);
                               }}
@@ -393,6 +613,11 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
                         </div>
                       ) : (
                         <div>
+                          {item.aiSummary && (
+                            <p className="text-[11px] text-purple-900 bg-purple-50 border border-purple-100 rounded p-1.5 mb-1.5">
+                              {item.aiSummary}
+                            </p>
+                          )}
                           <p className="text-slate-600 whitespace-pre-wrap break-words">
                             {item.notes || 'Sin notas'}
                           </p>
@@ -400,13 +625,16 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
                             type="button"
                             onClick={() => {
                               setEditingId(item.id);
+                              setDraftName(item.independentBusinessName);
+                              setDraftDistrict(item.district);
                               setDraftNotes(item.notes);
                               setDraftPhone(item.independentPhone);
                               setDraftEmail(item.independentEmail);
+                              setDraftLegalBasis(item.legalBasis);
                             }}
                             className="mt-1 text-purple-700 hover:underline font-medium"
                           >
-                            Editar notas / contacto
+                            Editar datos / autorización
                           </button>
                         </div>
                       )}

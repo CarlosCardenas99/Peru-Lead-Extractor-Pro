@@ -9,7 +9,10 @@ import { PlacesMapView } from './components/PlacesMapView';
 import { PlaceReviewDrawer } from './components/PlaceReviewDrawer';
 import { FollowupCrmView } from './components/FollowupCrmView';
 import { ExclusionManagerView } from './components/ExclusionManagerView';
+import { SmartFilterBar } from './components/SmartFilterBar';
+import { QualificationPreviewModal } from './components/QualificationPreviewModal';
 import {
+  analyzeLeadsComplementarily,
   buildBusinessLeadFromPlace,
   fetchQuotaStatus,
   fetchSubzoneSuggestions,
@@ -18,6 +21,7 @@ import {
 } from './services/geminiService';
 import {
   batchImportExclusions,
+  createBatchPreselectedFollowups,
   createFollowupRecord,
   formatFriendlyFirestoreError,
   removeDiscardPlace,
@@ -31,16 +35,23 @@ import {
   subscribeUserFollowups,
   testFirestoreConnection,
   updateFollowupRecord,
+  verifyUserFirestoreReadWrite,
 } from './services/firebaseService';
 import {
   BusinessLead,
+  DEFAULT_SMART_FILTERS,
   DiscardRecord,
   ExclusionRecord,
   FollowupLeadRecord,
+  FollowupSourceKind,
+  GeminiComplementaryAnalysis,
   GooglePlaceRaw,
+  LeadQualificationResult,
   PhoneVerificationStage,
+  QualifierBatchSummary,
   QuotaStatus,
   SearchParams,
+  SmartFilterState,
   WebsiteFilterOption,
 } from './types';
 import { analyzePeruvianPhone } from './utils/peruPhone';
@@ -48,6 +59,11 @@ import {
   buildExclusionKeySet,
   checkPlaceAgainstExclusions,
 } from './utils/exclusionUtils';
+import {
+  buildCrmAndDuplicateSets,
+  matchesSmartFilters,
+  qualifyLoadedLeadsBatch,
+} from './utils/leadQualifier';
 import {
   computeContactabilityScore,
   computeDigitalOpportunityScore,
@@ -82,6 +98,7 @@ const App: React.FC = () => {
   const [searchNotice, setSearchNotice] = useState<string>('');
   const [currentPage, setCurrentPage] = useState(1);
   const [websiteFilter, setWebsiteFilter] = useState<WebsiteFilterOption>('all');
+  const [smartFilters, setSmartFilters] = useState<SmartFilterState>(DEFAULT_SMART_FILTERS);
   const [showExcludedAndDiscarded, setShowExcludedAndDiscarded] = useState(false);
 
   // Subzone Gemini state
@@ -90,11 +107,20 @@ const App: React.FC = () => {
   const [subzoneError, setSubzoneError] = useState<string | null>(null);
   const [isLoadingSubzones, setIsLoadingSubzones] = useState(false);
 
-  // Quota, map & drawer state
+  // Quota, map, drawer & auto-qualifier state
   const [quota, setQuota] = useState<QuotaStatus | null>(null);
   const [selectedPlaceId, setSelectedPlaceId] = useState<string | null>(null);
   const [verifyingPlaceId, setVerifyingPlaceId] = useState<string | null>(null);
   const [isBatchVerifying, setIsBatchVerifying] = useState(false);
+  const [qualifierOpen, setQualifierOpen] = useState(false);
+  const [isQualifying, setIsQualifying] = useState(false);
+  const [qualifierProgress, setQualifierProgress] = useState('');
+  const [qualifierGeminiWarning, setQualifierGeminiWarning] = useState<string | null>(null);
+  const [qualificationResults, setQualificationResults] = useState<LeadQualificationResult[]>([]);
+  const [qualificationSummary, setQualificationSummary] = useState<QualifierBatchSummary | null>(
+    null
+  );
+  const [isTransferringPreselected, setIsTransferringPreselected] = useState(false);
 
   useEffect(() => {
     const onQuotaExceeded = () => setMapsQuotaBanner(true);
@@ -392,12 +418,14 @@ const App: React.FC = () => {
   const handlePromoteToFollowup = async (
     lead: BusinessLead,
     independentData: {
+      sourceKind: FollowupSourceKind;
       independentBusinessName: string;
       district: string;
       confirmedNoWebsite: boolean;
       independentPhone: string;
       phoneStage: PhoneVerificationStage;
       independentEmail: string;
+      legalBasis: string;
       notes: string;
     }
   ) => {
@@ -423,14 +451,11 @@ const App: React.FC = () => {
       independentData.independentEmail
     );
 
-    const hasIndependentCheck =
-      independentData.confirmedNoWebsite ||
-      lead.websiteProbe.provenance === 'independent_http' ||
-      independentData.phoneStage === 'independently_corroborated' ||
-      independentData.phoneStage === 'contact_reached';
+    const hasLegalAuthorization = (independentData.legalBasis || '').trim().length >= 8;
 
     await createFollowupRecord(user.uid, {
       placeId: lead.placeId,
+      sourceKind: independentData.sourceKind,
       independentBusinessName: independentData.independentBusinessName,
       district: independentData.district,
       confirmedNoWebsite: independentData.confirmedNoWebsite,
@@ -440,16 +465,189 @@ const App: React.FC = () => {
       independentEmail: independentData.independentEmail,
       independentDigitalScore: digitalEval.score,
       independentContactScore: contactEval.score,
-      stage: hasIndependentCheck ? 'Verificado independientemente' : 'Pendiente de revisión',
+      stage: hasLegalAuthorization ? 'CONTACTO AUTORIZADO' : 'PENDIENTE DE VERIFICACIÓN',
+      legalBasis: independentData.legalBasis,
+      qualificationTier: '',
+      aiSummary: '',
       notes: independentData.notes,
     });
   };
 
+  const handleRunAutoQualifier = async () => {
+    if (leads.length === 0) return;
+    setQualifierOpen(true);
+    setIsQualifying(true);
+    setQualifierGeminiWarning(null);
+    setQualifierProgress(
+      `Verificando URLs pendientes en los ${leads.length} resultados cargados...`
+    );
+
+    try {
+      // 1. Verificar URLs aún no comprobadas para los negocios móviles o no excluidos (en todo el lote cargado)
+      const leadsSnapshot = [...leads];
+      const existingSet = new Set(followups.map((f) => f.placeId));
+      const toProbe = leadsSnapshot.filter(
+        (l) =>
+          l.website &&
+          l.websiteProbe.provenance === 'google_absent' &&
+          !l.exclusionMatch.excluded &&
+          !discardedPlaceIds.has(l.placeId) &&
+          !existingSet.has(l.placeId)
+      );
+
+      const probedMap = new Map<string, BusinessLead['websiteProbe']>();
+      const PROBE_CONCURRENCY = 4;
+      for (let i = 0; i < toProbe.length; i += PROBE_CONCURRENCY) {
+        const chunk = toProbe.slice(i, i + PROBE_CONCURRENCY);
+        setQualifierProgress(
+          `Verificando sitios web independientes (${Math.min(
+            i + chunk.length,
+            toProbe.length
+          )}/${toProbe.length})...`
+        );
+        const results = await Promise.all(chunk.map((item) => verifyWebsiteUrl(item.website)));
+        chunk.forEach((item, idx) => {
+          probedMap.set(item.placeId, results[idx]);
+        });
+      }
+
+      const updatedLeads = leadsSnapshot.map((item) => {
+        const probe = probedMap.get(item.placeId);
+        if (!probe || item.confirmedNoWebsite) return item;
+        return {
+          ...item,
+          websiteProbe: probe,
+          digitalScore: computeDigitalOpportunityScore(probe, item.confirmedNoWebsite),
+        };
+      });
+      setLeads(updatedLeads);
+
+      // 2. Calificación determinística sobre TODOS los resultados cargados
+      setQualifierProgress('Ejecutando clasificación determinística WEBNEX...');
+      const deterministic = qualifyLoadedLeadsBatch(updatedLeads, {
+        discardedPlaceIds,
+        existingFollowups: followups,
+      });
+
+      // 3. Gemini complementario SOLO sobre señales permitidas (web oficial o notas propias) para casos donde aporta valor
+      const aiCandidates = deterministic.results
+        .filter((res) => res.tier === 'PRIORIDAD ALTA' || res.tier === 'REVISIÓN PENDIENTE')
+        .map((res) => {
+          const lead = updatedLeads.find((l) => l.placeId === res.placeId);
+          return { res, lead };
+        })
+        .filter(
+          (pair): pair is { res: LeadQualificationResult; lead: BusinessLead } =>
+            Boolean(pair.lead) &&
+            (Boolean(pair.lead.website && pair.lead.websiteProbe.status !== 'social_only') ||
+              Boolean(pair.lead.independentWebsiteNote.trim()))
+        )
+        .slice(0, 8);
+
+      const geminiMap = new Map<string, GeminiComplementaryAnalysis>();
+      if (aiCandidates.length > 0) {
+        setQualifierProgress(
+          `Analizando ${aiCandidates.length} sitios/notas independientes con Gemini (sin contenido Maps)...`
+        );
+        const aiRes = await analyzeLeadsComplementarily(
+          aiCandidates.map(({ lead }) => ({
+            placeId: lead.placeId,
+            category: lead.category,
+            websiteStatus: lead.websiteProbe.status,
+            officialWebsiteUrl: lead.website,
+            userNotes: lead.independentWebsiteNote,
+          }))
+        );
+        if (aiRes.quota) setQuota(aiRes.quota);
+        if (aiRes.warning) setQualifierGeminiWarning(aiRes.warning);
+        for (const analysis of aiRes.analyses) {
+          geminiMap.set(analysis.placeId, analysis);
+        }
+      }
+
+      const finalEval = qualifyLoadedLeadsBatch(updatedLeads, {
+        discardedPlaceIds,
+        existingFollowups: followups,
+        geminiAnalysesByPlaceId: geminiMap,
+      });
+
+      setQualificationResults(finalEval.results);
+      setQualificationSummary(finalEval.summary);
+    } finally {
+      setIsQualifying(false);
+    }
+  };
+
+  const handleConfirmTransferPreselected = async (selectedResults: LeadQualificationResult[]) => {
+    if (!user || !user.emailVerified) {
+      setFirebaseError('Inicia sesión con Google para guardar preselecciones en Firestore.');
+      return;
+    }
+
+    setIsTransferringPreselected(true);
+    try {
+      const existingPlaceIds = new Set(followups.map((f) => f.placeId));
+      const payloadItems = selectedResults.map((res) => {
+        const lead = leads.find((l) => l.placeId === res.placeId);
+        const aiText = res.geminiAnalysis
+          ? [
+              res.geminiAnalysis.commercialRelevance,
+              res.geminiAnalysis.recommendedWebnexServices.length > 0
+                ? `Servicios: ${res.geminiAnalysis.recommendedWebnexServices.join(', ')}`
+                : '',
+            ]
+              .filter(Boolean)
+              .join(' | ')
+          : '';
+
+        return {
+          placeId: res.placeId,
+          confirmedNoWebsite: Boolean(lead?.confirmedNoWebsite),
+          independentWebsiteStatus: lead?.websiteProbe.status || 'unregistered',
+          phoneStage: lead?.phoneAnalysis.stage || 'none',
+          independentDigitalScore: res.digitalScore,
+          independentContactScore: res.contactabilityScore,
+          stage:
+            res.tier === 'PRIORIDAD ALTA'
+              ? ('PRESELECCIONADO' as const)
+              : ('PENDIENTE DE VERIFICACIÓN' as const),
+          qualificationTier: res.tier,
+          aiSummary: aiText,
+          notes: res.reasons.join(' '),
+        };
+      });
+
+      const outcome = await createBatchPreselectedFollowups(
+        user.uid,
+        payloadItems,
+        existingPlaceIds
+      );
+      setQualifierOpen(false);
+      setSearchNotice(
+        `Preselección transferida a Seguimiento: ${outcome.created} nuevos registros guardados por Place ID (${outcome.skippedDuplicates} ya existían en CRM y no se duplicaron).`
+      );
+    } catch (err) {
+      setFirebaseError(formatFriendlyFirestoreError(err));
+    } finally {
+      setIsTransferringPreselected(false);
+    }
+  };
+
+  const { followupByPlaceId } = useMemo(
+    () => buildCrmAndDuplicateSets(leads, followups),
+    [leads, followups]
+  );
+
   const filteredLeads = useMemo(() => {
     return leads
       .filter((lead) => {
-        const isDiscarded = discardedPlaceIds.has(lead.placeId);
-        if (!showExcludedAndDiscarded && (isDiscarded || lead.exclusionMatch.excluded)) {
+        if (
+          !matchesSmartFilters(lead, smartFilters, {
+            discardedPlaceIds,
+            followupByPlaceId,
+            showExcludedAndDiscarded,
+          })
+        ) {
           return false;
         }
 
@@ -488,7 +686,9 @@ const App: React.FC = () => {
       .sort((a, b) => b.digitalScore.score - a.digitalScore.score);
   }, [
     leads,
+    smartFilters,
     discardedPlaceIds,
+    followupByPlaceId,
     showExcludedAndDiscarded,
     currentParams?.maxReviews,
     websiteFilter,
@@ -505,8 +705,11 @@ const App: React.FC = () => {
   );
 
   const funnelMetrics = useMemo(
-    () => computeIndependentFunnelMetrics(leads, followups),
-    [leads, followups]
+    () =>
+      computeIndependentFunnelMetrics(leads, followups, {
+        discardedPlaceIdsCount: discardedPlaceIds.size,
+      }),
+    [leads, followups, discardedPlaceIds.size]
   );
 
   const excludedCountInSession = useMemo(
@@ -642,6 +845,23 @@ const App: React.FC = () => {
               }}
             />
 
+            <SmartFilterBar
+              filters={smartFilters}
+              onChange={(next) => {
+                setSmartFilters(next);
+                setCurrentPage(1);
+              }}
+              onReset={() => {
+                setSmartFilters(DEFAULT_SMART_FILTERS);
+                setWebsiteFilter('all');
+                setCurrentPage(1);
+              }}
+              totalLoaded={leads.length}
+              filteredCount={filteredLeads.length}
+              isAnalyzing={isQualifying}
+              onRunAutoQualifier={handleRunAutoQualifier}
+            />
+
             {searchError && (
               <div className="bg-red-50 border border-red-200 text-red-900 rounded-xl p-4 text-sm">
                 <div className="font-semibold">Error en la consulta</div>
@@ -762,12 +982,12 @@ const App: React.FC = () => {
             isSignedIn={Boolean(user && user.emailVerified)}
             followups={followups}
             onSignIn={handleSignIn}
-            onUpdateFollowup={async (id, updates) => {
+            onUpdateFollowup={async (id, updates, currentRecord) => {
               if (!user) return;
               try {
-                await updateFollowupRecord(user.uid, id, updates);
-              } catch (err) {
-                setFirebaseError(formatFriendlyFirestoreError(err));
+                await updateFollowupRecord(user.uid, id, updates, currentRecord);
+              } catch (err: any) {
+                setFirebaseError(err?.message || formatFriendlyFirestoreError(err));
               }
             }}
             onCreateManualFollowup={async (payload) => {
@@ -797,6 +1017,7 @@ const App: React.FC = () => {
               );
               await createFollowupRecord(user.uid, {
                 placeId: `manual_${Date.now()}`,
+                sourceKind: 'independent_manual',
                 independentBusinessName: payload.independentBusinessName,
                 district: payload.district,
                 confirmedNoWebsite: payload.confirmedNoWebsite,
@@ -806,7 +1027,10 @@ const App: React.FC = () => {
                 independentEmail: payload.independentEmail,
                 independentDigitalScore: digitalEval.score,
                 independentContactScore: contactEval.score,
-                stage: 'Verificado independientemente',
+                stage: 'PENDIENTE DE VERIFICACIÓN',
+                legalBasis: payload.legalBasis,
+                qualificationTier: '',
+                aiSummary: '',
                 notes: payload.notes,
               });
             }}
@@ -816,9 +1040,16 @@ const App: React.FC = () => {
         {activeTab === 'exclusions' && (
           <ExclusionManagerView
             isSignedIn={Boolean(user && user.emailVerified)}
+            userEmail={user?.email || ''}
             exclusions={exclusions}
             exclusionKeys={exclusionKeys}
             onSignIn={handleSignIn}
+            onVerifyFirestoreAccess={async () => {
+              if (!user) {
+                throw new Error('Inicia sesión con Google antes de verificar Firestore.');
+              }
+              return verifyUserFirestoreReadWrite(user.uid);
+            }}
             onImportBatch={async (candidates, sourceLabel, onProgress) => {
               if (!user) return 0;
               return batchImportExclusions(user.uid, candidates, sourceLabel, onProgress);
@@ -844,6 +1075,20 @@ const App: React.FC = () => {
         onUpdateIndependentFields={handleUpdateIndependentFields}
         onPromoteToFollowup={handlePromoteToFollowup}
         onDiscardPlace={handleDiscardPlace}
+      />
+
+      <QualificationPreviewModal
+        isOpen={qualifierOpen}
+        isAnalyzing={isQualifying}
+        progressLabel={qualifierProgress}
+        geminiWarning={qualifierGeminiWarning}
+        leads={leads}
+        results={qualificationResults}
+        summary={qualificationSummary}
+        isSignedIn={Boolean(user && user.emailVerified)}
+        isSaving={isTransferringPreselected}
+        onClose={() => setQualifierOpen(false)}
+        onConfirmTransfer={handleConfirmTransferPreselected}
       />
     </div>
   );

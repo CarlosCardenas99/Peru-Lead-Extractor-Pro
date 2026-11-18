@@ -274,17 +274,37 @@ export function computeContactabilityScore(
 }
 
 /**
- * Calcula las 7 métricas independientes del embudo comercial sin inventar tasas de conversión.
+ * Calcula métricas independientes del cualificador y embudo comercial sin inventar tasas de conversión.
  */
 export function computeIndependentFunnelMetrics(
   sessionLeads: BusinessLead[],
-  followups: FollowupLeadRecord[]
+  followups: FollowupLeadRecord[],
+  extras?: {
+    discardedPlaceIdsCount?: number;
+  }
 ): IndependentFunnelMetrics {
   const uniquePlaceIds = new Set(sessionLeads.map((l) => l.placeId));
 
+  let discardedLandlineCount = 0;
+  let noMobileCount = 0;
+  let excludedOrDiscardedInSession = 0;
+
+  for (const lead of sessionLeads) {
+    const lt = lead.phoneAnalysis.lineType;
+    if (lt === 'landline_lima' || lt === 'landline_regional') {
+      discardedLandlineCount++;
+    }
+    if (lt !== 'mobile' || !lead.phoneAnalysis.isValidFormat) {
+      noMobileCount++;
+    }
+    if (lead.exclusionMatch.excluded) {
+      excludedOrDiscardedInSession++;
+    }
+  }
+
   const corroboratedRecords = followups.filter(
     (f) =>
-      f.stage !== 'Pendiente de revisión' ||
+      (f.stage !== 'PRESELECCIONADO' && f.stage !== 'PENDIENTE DE VERIFICACIÓN') ||
       f.phoneStage === 'independently_corroborated' ||
       f.phoneStage === 'contact_reached' ||
       f.confirmedNoWebsite
@@ -292,7 +312,7 @@ export function computeIndependentFunnelMetrics(
 
   const verifiableDigitalOpportunities = followups.filter(
     (f) =>
-      f.stage !== 'Descartado' &&
+      f.stage !== 'DESCARTADO' &&
       (f.confirmedNoWebsite ||
         f.independentWebsiteStatus === 'unreachable_verified' ||
         f.independentWebsiteStatus === 'social_only' ||
@@ -300,25 +320,53 @@ export function computeIndependentFunnelMetrics(
         f.independentWebsiteStatus === 'invalid_url')
   ).length;
 
-  const contactedStages = new Set([
-    'Contactado legalmente',
-    'Respondió',
-    'Interesado',
-    'Cotización',
-    'Cliente',
-  ]);
-  const responseStages = new Set(['Respondió', 'Interesado', 'Cotización', 'Cliente']);
-  const qualifiedStages = new Set(['Interesado', 'Cotización']);
+  const preselectedCount = followups.filter((f) => f.stage === 'PRESELECCIONADO').length;
 
+  const pendingCorroborationCount = followups.filter(
+    (f) =>
+      f.stage === 'PRESELECCIONADO' ||
+      f.stage === 'PENDIENTE DE VERIFICACIÓN' ||
+      f.independentWebsiteStatus === 'unverified_inconclusive' ||
+      (f.independentWebsiteStatus === 'unregistered' && !f.confirmedNoWebsite)
+  ).length;
+
+  const authorizedStageSet = new Set([
+    'CONTACTO AUTORIZADO',
+    'CONTACTADO',
+    'RESPONDIÓ',
+    'INTERESADO',
+    'COTIZACIÓN',
+    'CLIENTE',
+  ]);
+  const contactedStages = new Set([
+    'CONTACTADO',
+    'RESPONDIÓ',
+    'INTERESADO',
+    'COTIZACIÓN',
+    'CLIENTE',
+  ]);
+  const responseStages = new Set(['RESPONDIÓ', 'INTERESADO', 'COTIZACIÓN', 'CLIENTE']);
+  const qualifiedStages = new Set(['INTERESADO', 'COTIZACIÓN']);
+
+  const authorizedContactsCount = followups.filter(
+    (f) => authorizedStageSet.has(f.stage) && (f.legalBasis || '').trim().length >= 8
+  ).length;
   const authorizedContactsMade = followups.filter((f) => contactedStages.has(f.stage)).length;
   const responsesReceived = followups.filter((f) => responseStages.has(f.stage)).length;
   const qualifiedOpportunities = followups.filter((f) => qualifiedStages.has(f.stage)).length;
-  const confirmedSales = followups.filter((f) => f.stage === 'Cliente').length;
+  const confirmedSales = followups.filter((f) => f.stage === 'CLIENTE').length;
 
   return {
     uniqueBusinessesFound: uniquePlaceIds.size,
+    discardedLandlineCount,
+    noMobileCount,
     corroboratedRecords,
     verifiableDigitalOpportunities,
+    pendingCorroborationCount,
+    preselectedCount,
+    duplicatesAndExcludedCount:
+      excludedOrDiscardedInSession + (extras?.discardedPlaceIdsCount || 0),
+    authorizedContactsCount,
     authorizedContactsMade,
     responsesReceived,
     qualifiedOpportunities,

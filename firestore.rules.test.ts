@@ -25,4 +25,16 @@ describe('Firestore Security Rules (Eight Pillars & Dirty Dozen Static Audit)', 
     expect(rulesContent).not.toMatch(/allow\s+read\s*:\s*if\s+true/);
     expect(rulesContent).not.toMatch(/allow\s+write\s*:\s*if\s+true/);
   });
+
+  it('impone las 9 etapas comerciales y exige evidencia de base legal/consentimiento para CONTACTO AUTORIZADO y posteriores', () => {
+    expect(rulesContent).toContain("'PRESELECCIONADO'");
+    expect(rulesContent).toContain("'PENDIENTE DE VERIFICACIÓN'");
+    expect(rulesContent).toContain("'CONTACTO AUTORIZADO'");
+    expect(rulesContent).toContain("'CONTACTADO'");
+    expect(rulesContent).toContain("'CLIENTE'");
+    expect(rulesContent).toContain("'DESCARTADO'");
+    expect(rulesContent).toContain('requiresLegalBasis(');
+    expect(rulesContent).toContain('data.legalBasis.size() >= 8');
+    expect(rulesContent).toContain("data.sourceKind in ['places_preselection', 'independent_manual']");
+  });
 });

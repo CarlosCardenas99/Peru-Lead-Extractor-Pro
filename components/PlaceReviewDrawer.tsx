@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ExternalLink, ShieldCheck, Slash, UserPlus, X } from 'lucide-react';
 import {
   BusinessLead,
+  FollowupSourceKind,
   PhoneVerificationStage,
 } from '../types';
 import { analyzePeruvianPhone, getPhoneStageLabel } from '../utils/peruPhone';
@@ -25,12 +26,14 @@ interface PlaceReviewDrawerProps {
   onPromoteToFollowup: (
     lead: BusinessLead,
     independentData: {
+      sourceKind: FollowupSourceKind;
       independentBusinessName: string;
       district: string;
       confirmedNoWebsite: boolean;
       independentPhone: string;
       phoneStage: PhoneVerificationStage;
       independentEmail: string;
+      legalBasis: string;
       notes: string;
     }
   ) => Promise<void>;
@@ -53,6 +56,7 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
   const [independentPhone, setIndependentPhone] = useState('');
   const [phoneStage, setPhoneStage] = useState<PhoneVerificationStage>('none');
   const [independentEmail, setIndependentEmail] = useState('');
+  const [legalBasis, setLegalBasis] = useState('');
   const [notes, setNotes] = useState('');
   const [discardReason, setDiscardReason] = useState('No califica para diseño web');
   const [saving, setSaving] = useState(false);
@@ -60,13 +64,19 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
 
   useEffect(() => {
     if (!lead) return;
-    setIndependentName(lead.name);
-    const parts = lead.address.split(',').map((s) => s.trim());
-    setDistrict(parts.length >= 2 ? parts[parts.length - 2] : lead.address);
+    // Cumplimiento ToS: NO prellenar automáticamente datos de Google Maps en campos persistentes de CRM.
+    setIndependentName('');
+    setDistrict('');
     setConfirmedNoWebsite(lead.confirmedNoWebsite);
-    setIndependentPhone(lead.independentPhone || lead.phoneAnalysis.formatted || '');
-    setPhoneStage(lead.phoneAnalysis.stage);
+    setIndependentPhone(lead.independentPhone || '');
+    setPhoneStage(
+      lead.phoneAnalysis.stage === 'independently_corroborated' ||
+        lead.phoneAnalysis.stage === 'contact_reached'
+        ? lead.phoneAnalysis.stage
+        : 'none'
+    );
     setIndependentEmail(lead.independentEmail || '');
+    setLegalBasis('');
     setNotes(lead.independentWebsiteNote || '');
     setFeedback(null);
   }, [lead]);
@@ -89,17 +99,28 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
   const handlePromote = async () => {
     setSaving(true);
     setFeedback(null);
+    const trimmedName = independentName.trim();
+    const sourceKind: FollowupSourceKind = trimmedName ? 'independent_manual' : 'places_preselection';
     try {
       await onPromoteToFollowup(lead, {
-        independentBusinessName: independentName.trim() || lead.name,
+        sourceKind,
+        independentBusinessName: trimmedName,
         district: district.trim(),
         confirmedNoWebsite,
         independentPhone: phoneCheck.formatted || independentPhone.trim(),
-        phoneStage,
+        phoneStage:
+          trimmedName || independentPhone.trim()
+            ? phoneStage
+            : lead.phoneAnalysis.stage,
         independentEmail: independentEmail.trim(),
+        legalBasis: legalBasis.trim(),
         notes: notes.trim(),
       });
-      setFeedback('Guardado en Seguimiento CRM con datos independientes.');
+      setFeedback(
+        sourceKind === 'places_preselection'
+          ? 'Guardado en Seguimiento CRM como referencia por Place ID + metadatos propios (sin persistir datos de Maps).'
+          : 'Guardado en Seguimiento CRM con datos independientes verificados.'
+      );
     } catch (err: any) {
       setFeedback(err?.message || 'Error al guardar en CRM.');
     } finally {
@@ -187,7 +208,7 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
               </div>
             </dl>
             <p className="mt-3 text-[11px] text-slate-500">
-              Nota: Tener teléfono, muchas reseñas o buena calificación no se interpreta como intención de compra.
+              Nota: Tener teléfono, muchas reseñas o buena calificación no demuestra intención de compra ni presencia de WhatsApp.
             </p>
           </section>
 
@@ -264,26 +285,32 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
               Confirmado manualmente que el negocio NO tiene sitio web propio
             </label>
 
+            <p className="text-[11px] text-slate-500">
+              Si dejas los campos de identificación vacíos, al guardar en CRM se almacenará únicamente el <strong>Place ID</strong> y los metadatos propios (los detalles de Maps se hidratan en vivo en pantalla). Llena los campos manualmente solo con datos obtenidos de forma independiente.
+            </p>
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  Nombre para registro CRM independiente
+                  Nombre independiente (opcional)
                 </label>
                 <input
                   type="text"
                   value={independentName}
                   onChange={(e) => setIndependentName(e.target.value)}
+                  placeholder="Solo si fue capturado fuera de Maps"
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg"
                 />
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  Distrito / Zona
+                  Distrito / Zona independiente
                 </label>
                 <input
                   type="text"
                   value={district}
                   onChange={(e) => setDistrict(e.target.value)}
+                  placeholder="Ej: Los Olivos"
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg"
                 />
               </div>
@@ -320,17 +347,31 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
               </div>
             </div>
 
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                Correo electrónico obtenido independientemente
-              </label>
-              <input
-                type="email"
-                value={independentEmail}
-                onChange={(e) => setIndependentEmail(e.target.value)}
-                placeholder="contacto@empresa.pe"
-                className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg"
-              />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Correo electrónico independiente
+                </label>
+                <input
+                  type="email"
+                  value={independentEmail}
+                  onChange={(e) => setIndependentEmail(e.target.value)}
+                  placeholder="contacto@empresa.pe"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Base legal / consentimiento (si aplica)
+                </label>
+                <input
+                  type="text"
+                  value={legalBasis}
+                  onChange={(e) => setLegalBasis(e.target.value)}
+                  placeholder="Opcional en preselección"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg"
+                />
+              </div>
             </div>
 
             <div>

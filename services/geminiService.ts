@@ -1,9 +1,12 @@
 import {
   BusinessLead,
+  GeminiComplementaryAnalysis,
   GooglePlaceRaw,
+  HydratedPlaceDetails,
   QuotaStatus,
   SearchParams,
   WebsiteProbeResult,
+  WebsiteVerificationStatus,
 } from '../types';
 import { analyzePeruvianPhone } from '../utils/peruPhone';
 import { checkPlaceAgainstExclusions } from '../utils/exclusionUtils';
@@ -24,6 +27,13 @@ export interface SubzoneApiResponse {
   subzones: string[];
   rationale: string;
   fromCache: boolean;
+  quota: QuotaStatus;
+}
+
+export interface AnalyzeLeadsResponse {
+  analyses: GeminiComplementaryAnalysis[];
+  modelUsed: string;
+  warning: string | null;
   quota: QuotaStatus;
 }
 
@@ -128,6 +138,70 @@ export async function fetchSubzoneSuggestions(
     );
   }
   return data;
+}
+
+/**
+ * Envía a Gemini únicamente señales técnicas independientes (estado web comprobado,
+ * URL oficial para lectura HTML sin PII y notas escritas por el usuario).
+ * NUNCA envía nombres, direcciones, teléfonos ni reseñas de Google Maps.
+ */
+export async function analyzeLeadsComplementarily(
+  candidates: Array<{
+    placeId: string;
+    category: string;
+    websiteStatus: WebsiteVerificationStatus;
+    officialWebsiteUrl: string;
+    userNotes: string;
+  }>
+): Promise<AnalyzeLeadsResponse> {
+  if (candidates.length === 0) {
+    return {
+      analyses: [],
+      modelUsed: 'none',
+      warning: null,
+      quota: (await fetchQuotaStatus()) || {
+        dateLima: '',
+        placesUsed: 0,
+        placesLimit: 60,
+        geminiUsed: 0,
+        geminiLimit: 40,
+        note: '',
+      },
+    };
+  }
+
+  const res = await fetch('/api/analyze-leads', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ candidates: candidates.slice(0, 8) }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return {
+      analyses: [],
+      modelUsed: 'none',
+      warning: data.message || `Gemini no disponible (${res.status}); evaluación determinística aplicada.`,
+      quota: data.quota,
+    };
+  }
+  return data;
+}
+
+export async function fetchPlaceDetailsBatch(placeIds: string[]): Promise<{
+  details: Record<string, HydratedPlaceDetails>;
+  quota?: QuotaStatus;
+}> {
+  if (placeIds.length === 0) return { details: {} };
+  const res = await fetch('/api/places/details', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ placeIds: placeIds.slice(0, 10) }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return { details: {}, quota: data.quota };
+  }
+  return { details: data.details || {}, quota: data.quota };
 }
 
 export function buildBusinessLeadFromPlace(
