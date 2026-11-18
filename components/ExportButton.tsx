@@ -1,46 +1,81 @@
-
 import React from 'react';
-import { BusinessLead } from '../types';
+import { Download } from 'lucide-react';
+import { FollowupLeadRecord } from '../types';
 
 interface ExportButtonProps {
-  leads: BusinessLead[];
+  followups: FollowupLeadRecord[];
 }
 
-export const ExportButton: React.FC<ExportButtonProps> = ({ leads }) => {
+function escapeCsvCell(value: string | number | boolean): string {
+  const str = String(value ?? '');
+  // Prevent CSV spreadsheet formula injection
+  const safe = /^[=+\-@\t\r]/.test(str) ? `'${str}` : str;
+  return `"${safe.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Exporta EXCLUSIVAMENTE registros del módulo de seguimiento CRM que contienen
+ * datos obtenidos independientemente o ingresados manualmente por el equipo WEBNEX.
+ * Nunca exporta masivamente contenido restringido de Google Maps.
+ */
+export const ExportButton: React.FC<ExportButtonProps> = ({ followups }) => {
   const downloadCSV = () => {
-    const headers = ["Nombre de Negocio", "Calificación", "Reseñas", "Sitio Web", "Dirección Completa", "Número de Teléfono", "URL Google Maps"];
-    const rows = leads.map(l => [
-      `"${l.name.replace(/"/g, '""')}"`,
-      l.rating,
-      l.reviews,
-      `"${l.website}"`,
-      `"${l.address.replace(/"/g, '""')}"`,
-      `"${l.phone}"`,
-      l.mapsUrl
-    ]);
+    if (followups.length === 0) return;
 
-    const csvContent = "data:text/csv;charset=utf-8," 
-      + headers.join(",") + "\n"
-      + rows.map(e => e.join(",")).join("\n");
+    const headers = [
+      'Nombre Comercial Independiente',
+      'Distrito / Zona',
+      'Estado Seguimiento',
+      'Confirmado Sin Web',
+      'Estado Web Independiente',
+      'Teléfono Independiente',
+      'Estado Verificación Teléfono',
+      'Correo Independiente',
+      'Puntaje Oportunidad Digital',
+      'Puntaje Contactabilidad',
+      'Notas',
+      'Actualizado',
+    ];
 
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `leads_peru_${Date.now()}.csv`);
+    const rows = followups.map((item) =>
+      [
+        escapeCsvCell(item.independentBusinessName),
+        escapeCsvCell(item.district),
+        escapeCsvCell(item.stage),
+        escapeCsvCell(item.confirmedNoWebsite ? 'Sí' : 'No'),
+        escapeCsvCell(item.independentWebsiteStatus),
+        escapeCsvCell(item.independentPhone),
+        escapeCsvCell(item.phoneStage),
+        escapeCsvCell(item.independentEmail),
+        escapeCsvCell(item.independentDigitalScore),
+        escapeCsvCell(item.independentContactScore),
+        escapeCsvCell(item.notes),
+        escapeCsvCell(item.updatedAt),
+      ].join(',')
+    );
+
+    const csvContent = '\uFEFF' + [headers.map(escapeCsvCell).join(','), ...rows].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `webnex_seguimiento_independiente_${new Date().toISOString().slice(0, 10)}.csv`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   return (
     <button
+      type="button"
+      disabled={followups.length === 0}
       onClick={downloadCSV}
-      className="bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-4 rounded-lg flex items-center gap-2 transition-all shadow-md"
+      className="bg-purple-700 hover:bg-purple-800 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium py-2 px-4 rounded-lg text-xs inline-flex items-center gap-2 transition-colors whitespace-nowrap shrink-0"
+      title="Exporta únicamente registros del CRM con datos verificados independientemente"
     >
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-      </svg>
-      Descargar CSV
+      <Download className="w-4 h-4" />
+      Exportar CRM ({followups.length})
     </button>
   );
 };

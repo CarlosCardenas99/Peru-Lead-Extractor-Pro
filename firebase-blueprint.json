@@ -1,0 +1,191 @@
+{
+  "entities": {
+    "ExclusionEntry": {
+      "title": "ExclusionEntry",
+      "description": "Entrada normalizada de lista de exclusión propiedad del usuario (teléfono peruano, dominio o Place ID).",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["phone", "domain", "placeId"]
+        },
+        "normalizedValue": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "rawSample": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "sourceLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "type", "normalizedValue", "rawSample", "sourceLabel", "createdAt"]
+    },
+    "DiscardRecord": {
+      "title": "DiscardRecord",
+      "description": "Referencia por Place ID de establecimiento descartado por el usuario (sin almacenar contenido restringido de Maps).",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "placeId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "discardedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "placeId", "reason", "discardedAt"]
+    },
+    "FollowupLeadRecord": {
+      "title": "FollowupLeadRecord",
+      "description": "Registro CRM comercial con datos verificados independientemente o capturados legítimamente por el usuario.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "placeId": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "independentBusinessName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "district": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "confirmedNoWebsite": {
+          "type": "boolean"
+        },
+        "independentWebsiteStatus": {
+          "type": "string",
+          "enum": [
+            "unregistered",
+            "confirmed_none",
+            "active_https",
+            "active_http",
+            "social_only",
+            "unreachable_verified",
+            "unverified_inconclusive",
+            "invalid_url"
+          ]
+        },
+        "independentPhone": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "phoneStage": {
+          "type": "string",
+          "enum": [
+            "none",
+            "registered_invalid",
+            "registered_valid_format",
+            "independently_corroborated",
+            "contact_reached"
+          ]
+        },
+        "independentEmail": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "independentDigitalScore": {
+          "type": "number"
+        },
+        "independentContactScore": {
+          "type": "number"
+        },
+        "stage": {
+          "type": "string",
+          "enum": [
+            "Pendiente de revisión",
+            "Verificado independientemente",
+            "Contactado legalmente",
+            "Respondió",
+            "Interesado",
+            "Cotización",
+            "Cliente",
+            "Descartado"
+          ]
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "placeId",
+        "independentBusinessName",
+        "district",
+        "confirmedNoWebsite",
+        "independentWebsiteStatus",
+        "independentPhone",
+        "phoneStage",
+        "independentEmail",
+        "independentDigitalScore",
+        "independentContactScore",
+        "stage",
+        "notes",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/exclusions/{exclusionId}": {
+      "schema": { "$ref": "#/entities/ExclusionEntry" },
+      "description": "Entradas normalizadas de exclusión privadas por UID autorizado."
+    },
+    "/users/{userId}/discards/{placeId}": {
+      "schema": { "$ref": "#/entities/DiscardRecord" },
+      "description": "Place IDs descartados privados por UID autorizado."
+    },
+    "/users/{userId}/followups/{followupId}": {
+      "schema": { "$ref": "#/entities/FollowupLeadRecord" },
+      "description": "Seguimiento comercial independiente privado por UID autorizado."
+    }
+  }
+}

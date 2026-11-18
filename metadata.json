@@ -1,8 +1,10 @@
 {
   "name": "Peru Lead Extractor Pro",
-  "description": "Herramienta avanzada de extracción de leads comerciales en Perú usando Google Maps Grounding. Genera tablas y CSVs con información de contacto verificada.",
+  "description": "Buscador inteligente de oportunidades comerciales en Perú para WEBNEX SYSTEMS con Google Places API (New), mapa interactivo, verificación web y seguimiento comercial.",
   "requestFramePermissions": [
     "geolocation"
   ],
-  "majorCapabilities": []
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

@@ -1,0 +1,192 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedEmail() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedEmail() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 160 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidExclusion(data, userId) {
+      return data.keys().hasAll(['ownerUid', 'type', 'normalizedValue', 'rawSample', 'sourceLabel', 'createdAt']) &&
+        data.keys().hasOnly(['ownerUid', 'type', 'normalizedValue', 'rawSample', 'sourceLabel', 'createdAt']) &&
+        data.ownerUid is string && data.ownerUid == userId &&
+        data.type in ['phone', 'domain', 'placeId'] &&
+        data.normalizedValue is string && data.normalizedValue.size() >= 1 && data.normalizedValue.size() <= 200 &&
+        data.rawSample is string && data.rawSample.size() <= 200 &&
+        data.sourceLabel is string && data.sourceLabel.size() >= 1 && data.sourceLabel.size() <= 120 &&
+        data.createdAt == request.time;
+    }
+
+    function isValidDiscard(data, userId, placeId) {
+      return data.keys().hasAll(['ownerUid', 'placeId', 'reason', 'discardedAt']) &&
+        data.keys().hasOnly(['ownerUid', 'placeId', 'reason', 'discardedAt']) &&
+        data.ownerUid is string && data.ownerUid == userId &&
+        data.placeId is string && data.placeId == placeId && isValidId(data.placeId) &&
+        data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 300 &&
+        data.discardedAt == request.time;
+    }
+
+    function isValidWebsiteStatus(status) {
+      return status in [
+        'unregistered',
+        'confirmed_none',
+        'active_https',
+        'active_http',
+        'social_only',
+        'unreachable_verified',
+        'unverified_inconclusive',
+        'invalid_url'
+      ];
+    }
+
+    function isValidPhoneStage(stage) {
+      return stage in [
+        'none',
+        'registered_invalid',
+        'registered_valid_format',
+        'independently_corroborated',
+        'contact_reached'
+      ];
+    }
+
+    function isValidFollowupStage(stage) {
+      return stage in [
+        'Pendiente de revisión',
+        'Verificado independientemente',
+        'Contactado legalmente',
+        'Respondió',
+        'Interesado',
+        'Cotización',
+        'Cliente',
+        'Descartado'
+      ];
+    }
+
+    function isValidFollowup(data, userId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'placeId',
+          'independentBusinessName',
+          'district',
+          'confirmedNoWebsite',
+          'independentWebsiteStatus',
+          'independentPhone',
+          'phoneStage',
+          'independentEmail',
+          'independentDigitalScore',
+          'independentContactScore',
+          'stage',
+          'notes',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'placeId',
+          'independentBusinessName',
+          'district',
+          'confirmedNoWebsite',
+          'independentWebsiteStatus',
+          'independentPhone',
+          'phoneStage',
+          'independentEmail',
+          'independentDigitalScore',
+          'independentContactScore',
+          'stage',
+          'notes',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.ownerUid is string && data.ownerUid == userId &&
+        data.placeId is string && data.placeId.size() <= 160 &&
+        data.independentBusinessName is string && data.independentBusinessName.size() >= 1 && data.independentBusinessName.size() <= 160 &&
+        data.district is string && data.district.size() <= 120 &&
+        data.confirmedNoWebsite is bool &&
+        data.independentWebsiteStatus is string && isValidWebsiteStatus(data.independentWebsiteStatus) &&
+        data.independentPhone is string && data.independentPhone.size() <= 40 &&
+        data.phoneStage is string && isValidPhoneStage(data.phoneStage) &&
+        data.independentEmail is string && data.independentEmail.size() <= 160 &&
+        data.independentDigitalScore is number && data.independentDigitalScore >= 0 && data.independentDigitalScore <= 100 &&
+        data.independentContactScore is number && data.independentContactScore >= 0 && data.independentContactScore <= 100 &&
+        data.stage is string && isValidFollowupStage(data.stage) &&
+        data.notes is string && data.notes.size() <= 1000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt == request.time;
+    }
+
+    match /users/{userId}/exclusions/{exclusionId} {
+      allow get: if isOwner(userId) && isValidId(exclusionId);
+      allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+      allow create: if isOwner(userId) && isValidId(exclusionId) && isValidExclusion(incoming(), userId);
+      allow update: if false;
+      allow delete: if isOwner(userId) && isValidId(exclusionId) && existing().ownerUid == request.auth.uid;
+    }
+
+    match /users/{userId}/discards/{placeId} {
+      allow get: if isOwner(userId) && isValidId(placeId);
+      allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+      allow create: if isOwner(userId) && isValidId(placeId) && isValidDiscard(incoming(), userId, placeId);
+      allow update: if false;
+      allow delete: if isOwner(userId) && isValidId(placeId) && existing().ownerUid == request.auth.uid;
+    }
+
+    match /users/{userId}/followups/{followupId} {
+      allow get: if isOwner(userId) && isValidId(followupId);
+      allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+      allow create: if isOwner(userId) && isValidId(followupId) &&
+        isValidFollowup(incoming(), userId) &&
+        incoming().createdAt == request.time;
+      allow update: if isOwner(userId) && isValidId(followupId) &&
+        isValidFollowup(incoming(), userId) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().placeId == existing().placeId && (
+          // Action 1: Active pipeline stage, independent verification, or contact update
+          (existing().stage != 'Cliente' &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'independentBusinessName',
+              'district',
+              'confirmedNoWebsite',
+              'independentWebsiteStatus',
+              'independentPhone',
+              'phoneStage',
+              'independentEmail',
+              'independentDigitalScore',
+              'independentContactScore',
+              'stage',
+              'notes',
+              'updatedAt'
+            ])) ||
+          // Action 2: Client stage locked; only notes & timestamp editable
+          (existing().stage == 'Cliente' &&
+            incoming().stage == 'Cliente' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['notes', 'updatedAt']))
+        );
+      allow delete: if isOwner(userId) && isValidId(followupId) && existing().ownerUid == request.auth.uid;
+    }
+  }
+}

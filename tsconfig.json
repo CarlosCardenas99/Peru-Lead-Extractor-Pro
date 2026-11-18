@@ -11,7 +11,8 @@
     ],
     "skipLibCheck": true,
     "types": [
-      "node"
+      "node",
+      "google.maps"
     ],
     "moduleResolution": "bundler",
     "isolatedModules": true,
@@ -24,6 +25,8 @@
       ]
     },
     "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
     "noEmit": true
   }
 }

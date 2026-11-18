@@ -1,4 +1,3 @@
-
 import React from 'react';
 
 interface PaginationProps {
@@ -15,78 +14,72 @@ export const Pagination: React.FC<PaginationProps> = ({
   onPageChange,
 }) => {
   const totalPages = Math.ceil(totalItems / itemsPerPage);
-  
   if (totalPages <= 1) return null;
 
   return (
-    <div className="flex items-center justify-between bg-white px-4 py-3 sm:px-6 rounded-lg shadow-sm border border-gray-200 mt-4">
+    <div className="flex items-center justify-between bg-white px-4 py-3 rounded-xl border border-slate-200 mt-4">
       <div className="flex flex-1 justify-between sm:hidden">
         <button
+          type="button"
           onClick={() => onPageChange(Math.max(1, currentPage - 1))}
           disabled={currentPage === 1}
-          className="relative inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+          className="px-4 py-2 text-xs font-medium border border-slate-300 rounded-lg bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50"
         >
           Anterior
         </button>
         <button
+          type="button"
           onClick={() => onPageChange(Math.min(totalPages, currentPage + 1))}
           disabled={currentPage === totalPages}
-          className="relative ml-3 inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+          className="px-4 py-2 text-xs font-medium border border-slate-300 rounded-lg bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50"
         >
           Siguiente
         </button>
       </div>
       <div className="hidden sm:flex sm:flex-1 sm:items-center sm:justify-between">
-        <div>
-          <p className="text-sm text-gray-700">
-            Mostrando <span className="font-semibold">{(currentPage - 1) * itemsPerPage + 1}</span> a <span className="font-semibold">{Math.min(currentPage * itemsPerPage, totalItems)}</span> de <span className="font-semibold">{totalItems}</span> resultados
-          </p>
-        </div>
-        <div>
-          <nav className="isolate inline-flex -space-x-px rounded-md shadow-sm" aria-label="Pagination">
-            <button
-              onClick={() => onPageChange(currentPage - 1)}
-              disabled={currentPage === 1}
-              className="relative inline-flex items-center rounded-l-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 disabled:opacity-50"
-            >
-              <span className="sr-only">Anterior</span>
-              <svg className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                <path fillRule="evenodd" d="M12.79 5.23a.75.75 0 01.02 1.06L8.832 10l3.978 3.71a.75.75 0 11-1.04 1.08l-4.5-4.25a.75.75 0 010-1.08l4.5-4.25a.75.75 0 011.06.02z" clipRule="evenodd" />
-              </svg>
-            </button>
-            
-            {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
-               // Show a few pages around current
-               let pageNum = currentPage;
-               if (currentPage < 3) pageNum = i + 1;
-               else if (currentPage > totalPages - 2) pageNum = totalPages - 4 + i;
-               else pageNum = currentPage - 2 + i;
-               
-               if (pageNum < 1 || pageNum > totalPages) return null;
-
-               return (
-                <button
-                  key={pageNum}
-                  onClick={() => onPageChange(pageNum)}
-                  className={`relative inline-flex items-center px-4 py-2 text-sm font-semibold ${currentPage === pageNum ? 'z-10 bg-purple-700 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-600' : 'text-gray-900 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0'}`}
-                >
-                  {pageNum}
-                </button>
-               );
-            })}
-
-            <button
-              onClick={() => onPageChange(currentPage + 1)}
-              disabled={currentPage === totalPages}
-              className="relative inline-flex items-center rounded-r-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 disabled:opacity-50"
-            >
-              <span className="sr-only">Siguiente</span>
-              <svg className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                <path fillRule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.19 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clipRule="evenodd" />
-              </svg>
-            </button>
-          </nav>
-        </div>
+        <p className="text-xs text-slate-600 font-mono-tabular">
+          Mostrando {(currentPage - 1) * itemsPerPage + 1} a{' '}
+          {Math.min(currentPage * itemsPerPage, totalItems)} de {totalItems} resultados locales
+        </p>
+        <nav className="inline-flex -space-x-px rounded-lg shadow-xs" aria-label="Paginación">
+          <button
+            type="button"
+            onClick={() => onPageChange(currentPage - 1)}
+            disabled={currentPage === 1}
+            className="px-3 py-1.5 text-xs font-medium text-slate-600 border border-slate-300 rounded-l-lg hover:bg-slate-50 disabled:opacity-50"
+          >
+            Anterior
+          </button>
+          {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+            let pageNum = currentPage;
+            if (currentPage < 3) pageNum = i + 1;
+            else if (currentPage > totalPages - 2) pageNum = totalPages - 4 + i;
+            else pageNum = currentPage - 2 + i;
+            if (pageNum < 1 || pageNum > totalPages) return null;
+            return (
+              <button
+                key={pageNum}
+                type="button"
+                onClick={() => onPageChange(pageNum)}
+                className={`px-3 py-1.5 text-xs font-semibold border border-slate-300 font-mono-tabular ${
+                  currentPage === pageNum
+                    ? 'bg-purple-700 text-white border-purple-700 z-10'
+                    : 'bg-white text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                {pageNum}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={() => onPageChange(currentPage + 1)}
+            disabled={currentPage === totalPages}
+            className="px-3 py-1.5 text-xs font-medium text-slate-600 border border-slate-300 rounded-r-lg hover:bg-slate-50 disabled:opacity-50"
+          >
+            Siguiente
+          </button>
+        </nav>
       </div>
     </div>
   );
