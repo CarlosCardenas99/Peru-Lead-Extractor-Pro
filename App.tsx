@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { User } from 'firebase/auth';
 import { ChevronRight, LogIn, LogOut, ShieldCheck } from 'lucide-react';
 import { SearchForm } from './components/SearchForm';
@@ -6,14 +6,18 @@ import { LeadTable } from './components/LeadTable';
 import { Pagination } from './components/Pagination';
 import { FunnelMetricsBar } from './components/FunnelMetricsBar';
 import { PlacesMapView } from './components/PlacesMapView';
-import { PlaceReviewDrawer } from './components/PlaceReviewDrawer';
+import { PlaceReviewDrawer, DrawerPromoteIndependentData } from './components/PlaceReviewDrawer';
 import { FollowupCrmView } from './components/FollowupCrmView';
 import { ExclusionManagerView } from './components/ExclusionManagerView';
 import { SmartFilterBar } from './components/SmartFilterBar';
-import { QualificationPreviewModal } from './components/QualificationPreviewModal';
+import {
+  PreparedTransferItem,
+  QualificationPreviewModal,
+} from './components/QualificationPreviewModal';
 import {
   analyzeLeadsComplementarily,
   buildBusinessLeadFromPlace,
+  fetchPlaceDetailsBatch,
   fetchQuotaStatus,
   fetchSubzoneSuggestions,
   searchPlacesPage,
@@ -23,7 +27,10 @@ import {
   batchImportExclusions,
   createBatchPreselectedFollowups,
   createFollowupRecord,
+  CreateFollowupOutcome,
+  fetchFollowupsIntegritySnapshot,
   formatFriendlyFirestoreError,
+  recoverMissingFollowupFieldsBatch,
   removeDiscardPlace,
   removeExclusionEntry,
   saveDiscardPlace,
@@ -35,25 +42,39 @@ import {
   subscribeUserFollowups,
   testFirestoreConnection,
   updateFollowupRecord,
+  UpdateFollowupOutcome,
   verifyUserFirestoreReadWrite,
 } from './services/firebaseService';
 import {
   BusinessLead,
+  CrmWorkspaceMode,
   DEFAULT_SMART_FILTERS,
   DiscardRecord,
   ExclusionRecord,
   FollowupLeadRecord,
-  FollowupSourceKind,
   GeminiComplementaryAnalysis,
   GooglePlaceRaw,
   LeadQualificationResult,
   PhoneVerificationStage,
+  PlaceHydrationEntry,
+  PlacesQuotaBlockState,
   QualifierBatchSummary,
   QuotaStatus,
   SearchParams,
   SmartFilterState,
   WebsiteFilterOption,
 } from './types';
+import {
+  mergeHydrationBatchResults,
+  selectNextHydrationBatch,
+  SESSION_CACHE_TTL_MS,
+} from './utils/followupHydration';
+import {
+  encodeVerificationProvenanceEntry,
+  evaluateFollowupCompleteness,
+  resolveIndependentPhoneType,
+  resolveIndependentWebsiteStatusForSave,
+} from './utils/fieldCompliance';
 import { analyzePeruvianPhone } from './utils/peruPhone';
 import {
   buildExclusionKeySet,
@@ -68,6 +89,7 @@ import {
   computeContactabilityScore,
   computeDigitalOpportunityScore,
   computeIndependentFunnelMetrics,
+  computeInformationTrustScore,
   deduplicatePlacesById,
 } from './utils/scoring';
 
@@ -83,9 +105,12 @@ const App: React.FC = () => {
   const [mapsQuotaBanner, setMapsQuotaBanner] = useState(false);
 
   // Persistent user collections from Firestore (empty until authenticated)
+  const [workspaceMode, setWorkspaceMode] = useState<CrmWorkspaceMode>('production');
   const [exclusions, setExclusions] = useState<ExclusionRecord[]>([]);
   const [discards, setDiscards] = useState<DiscardRecord[]>([]);
-  const [followups, setFollowups] = useState<FollowupLeadRecord[]>([]);
+  const [productionFollowups, setProductionFollowups] = useState<FollowupLeadRecord[]>([]);
+  const [sandboxFollowups, setSandboxFollowups] = useState<FollowupLeadRecord[]>([]);
+  const followups = workspaceMode === 'sandbox' ? sandboxFollowups : productionFollowups;
   const [localSessionDiscards, setLocalSessionDiscards] = useState<Set<string>>(new Set());
 
   // Transient session search state (never bulk-persisted or exported)
@@ -122,12 +147,62 @@ const App: React.FC = () => {
   );
   const [isTransferringPreselected, setIsTransferringPreselected] = useState(false);
 
+  // Shared session-only Place Details hydration cache (survives tab switches, TTL 30m, never persisted or exported)
+  const [hydrationCache, setHydrationCache] = useState<Record<string, PlaceHydrationEntry>>({});
+  const hydrationCacheRef = useRef<Record<string, PlaceHydrationEntry>>({});
+  hydrationCacheRef.current = hydrationCache;
+  const inFlightPlaceIdsRef = useRef<Set<string>>(new Set());
+
+  const [placesQuotaBlock, setPlacesQuotaBlock] = useState<PlacesQuotaBlockState>({
+    blocked: false,
+    source: 'none',
+    message: null,
+  });
+  const placesQuotaBlockRef = useRef<PlacesQuotaBlockState>(placesQuotaBlock);
+  placesQuotaBlockRef.current = placesQuotaBlock;
+
+  const syncQuotaFromServer = useCallback((q?: QuotaStatus | null) => {
+    if (!q) return;
+    setQuota(q);
+    if (q.googleQuotaBlocked) {
+      setMapsQuotaBanner(true);
+      setPlacesQuotaBlock({
+        blocked: true,
+        source: 'google_resource_exhausted',
+        message:
+          q.googleQuotaBlockedMessage ||
+          'Google Places API (New) reportó cuota agotada (429 RESOURCE_EXHAUSTED).',
+      });
+    } else if (q.placesUsed >= q.placesLimit) {
+      setPlacesQuotaBlock({
+        blocked: true,
+        source: 'local_preventive_limit',
+        message:
+          'Se alcanzó el límite diario preventivo local configurado en este servidor (independiente de la cuota real de Google).',
+      });
+    } else {
+      setPlacesQuotaBlock({ blocked: false, source: 'none', message: null });
+    }
+  }, []);
+
   useEffect(() => {
-    const onQuotaExceeded = () => setMapsQuotaBanner(true);
+    const onQuotaExceeded = () => {
+      setMapsQuotaBanner(true);
+      setPlacesQuotaBlock((prev) =>
+        prev.source === 'google_resource_exhausted'
+          ? prev
+          : {
+              blocked: true,
+              source: 'google_resource_exhausted',
+              message:
+                'Google Places API (New) devolvió 429 RESOURCE_EXHAUSTED. Las consultas se detuvieron automáticamente.',
+            }
+      );
+    };
     window.addEventListener('gmp-quota-exceeded', onQuotaExceeded);
     testFirestoreConnection();
     fetchQuotaStatus().then((q) => {
-      if (q) setQuota(q);
+      if (q) syncQuotaFromServer(q);
     });
 
     const unsubAuth = subscribeToAuth((u) => {
@@ -139,13 +214,14 @@ const App: React.FC = () => {
       window.removeEventListener('gmp-quota-exceeded', onQuotaExceeded);
       unsubAuth();
     };
-  }, []);
+  }, [syncQuotaFromServer]);
 
   useEffect(() => {
     if (!authReady || !user || !user.emailVerified) {
       setExclusions([]);
       setDiscards([]);
-      setFollowups([]);
+      setProductionFollowups([]);
+      setSandboxFollowups([]);
       return;
     }
 
@@ -159,20 +235,121 @@ const App: React.FC = () => {
       (items) => setDiscards(items),
       (msg) => setFirebaseError(msg)
     );
-    const unsubFoll = subscribeUserFollowups(
+    const unsubProd = subscribeUserFollowups(
       user.uid,
-      (items) => setFollowups(items),
-      (msg) => setFirebaseError(msg)
+      (items) => setProductionFollowups(items),
+      (msg) => setFirebaseError(msg),
+      'production'
+    );
+    const unsubSandbox = subscribeUserFollowups(
+      user.uid,
+      (items) => setSandboxFollowups(items),
+      (msg) => setFirebaseError(msg),
+      'sandbox'
     );
 
     return () => {
       unsubExcl();
       unsubDisc();
-      unsubFoll();
+      unsubProd();
+      unsubSandbox();
     };
   }, [authReady, user]);
 
+  const hydrateFollowupPlaceIds = useCallback(
+    async (
+      candidatePlaceIds: string[],
+      options?: { isManualRetry?: boolean; maxBatchSize?: number }
+    ) => {
+      // Si la cuota real de Google o el límite preventivo local están bloqueados, NO disparar ninguna llamada
+      if (placesQuotaBlockRef.current.blocked) {
+        return;
+      }
+
+      const availableIds = candidatePlaceIds.filter(
+        (id) => id && !inFlightPlaceIdsRef.current.has(id)
+      );
+      const batch = selectNextHydrationBatch(availableIds, hydrationCacheRef.current, {
+        isManualRetry: options?.isManualRetry,
+        maxBatchSize: Math.min(5, options?.maxBatchSize ?? 5),
+      });
+      if (batch.length === 0) return;
+
+      for (const id of batch) {
+        inFlightPlaceIdsRef.current.add(id);
+      }
+
+      const preSnapshot = { ...hydrationCacheRef.current };
+      setHydrationCache((prev) => {
+        const next = { ...prev };
+        for (const id of batch) {
+          const existing = prev[id];
+          next[id] = {
+            placeId: id,
+            status: 'loading',
+            details: existing?.details ?? null,
+            retryCount: options?.isManualRetry ? 0 : existing?.retryCount ?? 0,
+            updatedAt: Date.now(),
+            expiresAt: existing?.expiresAt,
+          };
+        }
+        return next;
+      });
+
+      try {
+        const response = await fetchPlaceDetailsBatch(batch);
+        if (response.quota) {
+          syncQuotaFromServer(response.quota);
+        }
+
+        if (response.quotaExceeded) {
+          setMapsQuotaBanner(true);
+          setPlacesQuotaBlock({
+            blocked: true,
+            source: 'google_resource_exhausted',
+            message:
+              response.quota?.googleQuotaBlockedMessage ||
+              response.topLevelError ||
+              'Google Places API (New) devolvió 429 RESOURCE_EXHAUSTED. Consultas detenidas.',
+          });
+        } else if (response.localQuotaReached) {
+          setPlacesQuotaBlock({
+            blocked: true,
+            source: 'local_preventive_limit',
+            message:
+              response.topLevelError ||
+              'Se alcanzó el límite preventivo diario local configurado en el servidor.',
+          });
+        }
+
+        const baseForMerge = options?.isManualRetry
+          ? Object.fromEntries(
+              Object.entries(preSnapshot).map(([k, v]) => [
+                k,
+                batch.includes(k) ? { ...v, retryCount: 0 } : v,
+              ])
+            )
+          : preSnapshot;
+
+        const merged = mergeHydrationBatchResults(baseForMerge, batch, response.results);
+        setHydrationCache((prev) => ({ ...prev, ...merged }));
+      } finally {
+        for (const id of batch) {
+          inFlightPlaceIdsRef.current.delete(id);
+        }
+      }
+    },
+    [syncQuotaFromServer]
+  );
+
   const exclusionKeys = useMemo(() => buildExclusionKeySet(exclusions), [exclusions]);
+  const exclusionPlaceIds = useMemo(
+    () =>
+      new Set(
+        exclusions.filter((e) => e.type === 'placeId').map((e) => e.normalizedValue)
+      ),
+    [exclusions]
+  );
   const discardedPlaceIds = useMemo(() => {
     const set = new Set<string>(localSessionDiscards);
     for (const d of discards) set.add(d.placeId);
@@ -204,6 +381,35 @@ const App: React.FC = () => {
     await signOutFirebase();
   };
 
+  const seedSessionHydrationCache = useCallback((placesList: GooglePlaceRaw[]) => {
+    if (!placesList || placesList.length === 0) return;
+    const now = Date.now();
+    setHydrationCache((prev) => {
+      const next = { ...prev };
+      for (const r of placesList) {
+        if (!r.placeId || r.placeId.startsWith('manual_')) continue;
+        next[r.placeId] = {
+          placeId: r.placeId,
+          status: 'loaded',
+          details: {
+            placeId: r.placeId,
+            displayName: r.displayName,
+            formattedAddress: r.formattedAddress,
+            nationalPhoneNumber: r.nationalPhoneNumber ?? null,
+            internationalPhoneNumber: r.internationalPhoneNumber ?? null,
+            websiteUri: r.websiteUri ?? null,
+            googleMapsUri: r.googleMapsUri,
+            businessStatus: r.businessStatus,
+          },
+          retryCount: 0,
+          updatedAt: now,
+          expiresAt: now + SESSION_CACHE_TTL_MS,
+        };
+      }
+      return next;
+    });
+  }, []);
+
   const handleSearch = async (params: SearchParams) => {
     setIsLoading(true);
     setSearchError(null);
@@ -214,9 +420,11 @@ const App: React.FC = () => {
 
     try {
       const response = await searchPlacesPage(params);
-      setQuota(response.quota);
+      syncQuotaFromServer(response.quota);
       const uniqueRaw = deduplicatePlacesById([], response.places);
       setRawPlaces(uniqueRaw);
+      // Sembrar caché de sesión directamente desde Explorador (0 llamadas Place Details)
+      seedSessionHydrationCache(uniqueRaw);
 
       const built = uniqueRaw.map((r) =>
         buildBusinessLeadFromPlace(r, params.businessType, exclusionKeys)
@@ -234,7 +442,7 @@ const App: React.FC = () => {
         );
       }
     } catch (err: any) {
-      if (err?.quota) setQuota(err.quota);
+      if (err?.quota) syncQuotaFromServer(err.quota);
       setRawPlaces([]);
       setLeads([]);
       setNextPageToken(null);
@@ -251,10 +459,11 @@ const App: React.FC = () => {
 
     try {
       const response = await searchPlacesPage(currentParams, nextPageToken);
-      setQuota(response.quota);
+      syncQuotaFromServer(response.quota);
       const mergedRaw = deduplicatePlacesById(rawPlaces, response.places);
       const newOnly = mergedRaw.slice(rawPlaces.length);
       setRawPlaces(mergedRaw);
+      seedSessionHydrationCache(newOnly);
 
       const builtNew = newOnly.map((r) =>
         buildBusinessLeadFromPlace(r, currentParams.businessType, exclusionKeys)
@@ -265,7 +474,7 @@ const App: React.FC = () => {
         `Página adicional cargada: +${builtNew.length} negocios únicos (total ${mergedRaw.length}).`
       );
     } catch (err: any) {
-      if (err?.quota) setQuota(err.quota);
+      if (err?.quota) syncQuotaFromServer(err.quota);
       setSearchError(err?.message || 'No se pudo cargar la siguiente página.');
     } finally {
       setIsLoading(false);
@@ -288,11 +497,12 @@ const App: React.FC = () => {
     }
   };
 
-  const handleVerifyWebsite = useCallback(async (lead: BusinessLead) => {
-    if (!lead.website) return;
+  const handleVerifyWebsite = useCallback(async (lead: BusinessLead, overrideUrl?: string) => {
+    const targetUrl = (overrideUrl || lead.website || '').trim();
+    if (!targetUrl) return;
     setVerifyingPlaceId(lead.placeId);
     try {
-      const probe = await verifyWebsiteUrl(lead.website);
+      const probe = await verifyWebsiteUrl(targetUrl);
       setLeads((prev) =>
         prev.map((item) => {
           if (item.placeId !== lead.placeId) return item;
@@ -302,7 +512,17 @@ const App: React.FC = () => {
           return {
             ...item,
             websiteProbe: nextProbe,
-            digitalScore: computeDigitalOpportunityScore(nextProbe, item.confirmedNoWebsite),
+            digitalScore: computeDigitalOpportunityScore(nextProbe, item.confirmedNoWebsite, {
+              category: item.category,
+            }),
+            trustScore: computeInformationTrustScore({
+              businessStatus: item.businessStatus,
+              independentPhone: item.independentPhone,
+              confirmedNoWebsite: item.confirmedNoWebsite,
+              independentCategory: item.category,
+              websiteProbe: nextProbe,
+              lastVerifiedAt: nextProbe.verifiedAt,
+            }),
           };
         })
       );
@@ -368,6 +588,23 @@ const App: React.FC = () => {
               : lead.phoneAnalysis.stage,
         };
 
+        const nextDigital = computeDigitalOpportunityScore(nextProbe, patch.confirmedNoWebsite, {
+          category: lead.category,
+        });
+        const nextContact = computeContactabilityScore(
+          nextGooglePhone,
+          independentPhoneParsed,
+          patch.independentEmail
+        );
+        const nextTrust = computeInformationTrustScore({
+          businessStatus: lead.businessStatus,
+          independentPhone: independentPhoneParsed.formatted || patch.independentPhone.trim(),
+          confirmedNoWebsite: patch.confirmedNoWebsite,
+          independentCategory: lead.category,
+          websiteProbe: nextProbe,
+          lastVerifiedAt: new Date().toISOString(),
+        });
+
         return {
           ...lead,
           confirmedNoWebsite: patch.confirmedNoWebsite,
@@ -376,12 +613,9 @@ const App: React.FC = () => {
           independentWebsiteNote: patch.independentWebsiteNote,
           phoneAnalysis: nextGooglePhone,
           websiteProbe: nextProbe,
-          digitalScore: computeDigitalOpportunityScore(nextProbe, patch.confirmedNoWebsite),
-          contactabilityScore: computeContactabilityScore(
-            nextGooglePhone,
-            independentPhoneParsed,
-            patch.independentEmail
-          ),
+          digitalScore: nextDigital,
+          contactabilityScore: nextContact,
+          trustScore: nextTrust,
         };
       })
     );
@@ -417,18 +651,8 @@ const App: React.FC = () => {
 
   const handlePromoteToFollowup = async (
     lead: BusinessLead,
-    independentData: {
-      sourceKind: FollowupSourceKind;
-      independentBusinessName: string;
-      district: string;
-      confirmedNoWebsite: boolean;
-      independentPhone: string;
-      phoneStage: PhoneVerificationStage;
-      independentEmail: string;
-      legalBasis: string;
-      notes: string;
-    }
-  ) => {
+    independentData: DrawerPromoteIndependentData
+  ): Promise<CreateFollowupOutcome> => {
     if (!user || !user.emailVerified) {
       throw new Error('Inicia sesión con Google para guardar seguimientos en Firestore.');
     }
@@ -437,40 +661,75 @@ const App: React.FC = () => {
       independentData.independentPhone,
       independentData.phoneStage
     );
-    const nextProbe = independentData.confirmedNoWebsite
-      ? { ...lead.websiteProbe, status: 'confirmed_none' as const }
-      : lead.websiteProbe;
+    const resolvedWebsiteStatus = resolveIndependentWebsiteStatusForSave({
+      independentWebsite: independentData.independentWebsite,
+      confirmedNoWebsite: independentData.confirmedNoWebsite,
+      verifiedProbe: lead.websiteProbe,
+    });
+    const nextProbe = { ...lead.websiteProbe, status: resolvedWebsiteStatus };
 
     const digitalEval = computeDigitalOpportunityScore(
       nextProbe,
-      independentData.confirmedNoWebsite
+      independentData.confirmedNoWebsite,
+      { category: independentData.independentCategory || lead.category }
     );
     const contactEval = computeContactabilityScore(
       lead.phoneAnalysis,
       phoneParsed,
-      independentData.independentEmail
+      independentData.independentEmail,
+      { legalBasis: independentData.legalBasis }
     );
+    const completeness = evaluateFollowupCompleteness({
+      independentBusinessName: independentData.independentBusinessName,
+      independentPhone: independentData.independentPhone,
+      independentAddress: independentData.independentAddress,
+      district: independentData.district,
+      independentWebsite: independentData.independentWebsite,
+      confirmedNoWebsite: independentData.confirmedNoWebsite,
+      independentEmail: independentData.independentEmail,
+      independentCategory: independentData.independentCategory,
+    });
 
     const hasLegalAuthorization = (independentData.legalBasis || '').trim().length >= 8;
 
-    await createFollowupRecord(user.uid, {
-      placeId: lead.placeId,
-      sourceKind: independentData.sourceKind,
-      independentBusinessName: independentData.independentBusinessName,
-      district: independentData.district,
-      confirmedNoWebsite: independentData.confirmedNoWebsite,
-      independentWebsiteStatus: nextProbe.status,
-      independentPhone: independentData.independentPhone,
-      phoneStage: independentData.phoneStage,
-      independentEmail: independentData.independentEmail,
-      independentDigitalScore: digitalEval.score,
-      independentContactScore: contactEval.score,
-      stage: hasLegalAuthorization ? 'CONTACTO AUTORIZADO' : 'PENDIENTE DE VERIFICACIÓN',
-      legalBasis: independentData.legalBasis,
-      qualificationTier: '',
-      aiSummary: '',
-      notes: independentData.notes,
-    });
+    const outcome = await createFollowupRecord(
+      user.uid,
+      {
+        placeId: lead.placeId,
+        sourceKind: independentData.sourceKind,
+        independentBusinessName: independentData.independentBusinessName,
+        district: independentData.district,
+        independentAddress: independentData.independentAddress,
+        independentWebsite: independentData.independentWebsite,
+        independentCategory: independentData.independentCategory,
+        confirmedNoWebsite: independentData.confirmedNoWebsite,
+        independentWebsiteStatus: resolvedWebsiteStatus,
+        independentPhone: independentData.independentPhone,
+        independentPhoneType: independentData.independentPhoneType,
+        phoneStage: independentData.phoneStage,
+        independentEmail: independentData.independentEmail,
+        independentDigitalScore: digitalEval.score,
+        independentContactScore: contactEval.score,
+        independentTrustScore: independentData.independentTrustScore,
+        completenessStatus: completeness.status,
+        stage: hasLegalAuthorization ? 'CONTACTO AUTORIZADO' : 'PENDIENTE DE VERIFICACIÓN',
+        legalBasis: independentData.legalBasis,
+        qualificationTier: '',
+        aiSummary: '',
+        notes: independentData.notes,
+        verificationSummary: independentData.verificationSummary,
+        lastVerifiedAt: independentData.lastVerifiedAt,
+        verificationSources: independentData.verificationSources,
+      },
+      workspaceMode
+    );
+
+    const rawPlace = rawPlaces.find((r) => r.placeId === lead.placeId);
+    if (rawPlace) {
+      seedSessionHydrationCache([rawPlace]);
+    }
+
+    return outcome;
   };
 
   const handleRunAutoQualifier = async () => {
@@ -517,7 +776,17 @@ const App: React.FC = () => {
         return {
           ...item,
           websiteProbe: probe,
-          digitalScore: computeDigitalOpportunityScore(probe, item.confirmedNoWebsite),
+          digitalScore: computeDigitalOpportunityScore(probe, item.confirmedNoWebsite, {
+            category: item.category,
+          }),
+          trustScore: computeInformationTrustScore({
+            businessStatus: item.businessStatus,
+            independentPhone: item.independentPhone,
+            confirmedNoWebsite: item.confirmedNoWebsite,
+            independentCategory: item.category,
+            websiteProbe: probe,
+            lastVerifiedAt: probe.verifiedAt,
+          }),
         };
       });
       setLeads(updatedLeads);
@@ -529,7 +798,7 @@ const App: React.FC = () => {
         existingFollowups: followups,
       });
 
-      // 3. Gemini complementario SOLO sobre señales permitidas (web oficial o notas propias) para casos donde aporta valor
+      // 3. Gemini complementario SOLO cuando existe evidencia HTML analizable o notas propias sustantivas (>= 15 chars)
       const aiCandidates = deterministic.results
         .filter((res) => res.tier === 'PRIORIDAD ALTA' || res.tier === 'REVISIÓN PENDIENTE')
         .map((res) => {
@@ -539,8 +808,11 @@ const App: React.FC = () => {
         .filter(
           (pair): pair is { res: LeadQualificationResult; lead: BusinessLead } =>
             Boolean(pair.lead) &&
-            (Boolean(pair.lead.website && pair.lead.websiteProbe.status !== 'social_only') ||
-              Boolean(pair.lead.independentWebsiteNote.trim()))
+            ((Boolean(pair.lead.website) &&
+              pair.lead.websiteProbe.status !== 'social_only' &&
+              pair.lead.websiteProbe.status !== 'unreachable_verified' &&
+              pair.lead.websiteProbe.status !== 'invalid_url') ||
+              pair.lead.independentWebsiteNote.trim().length >= 15)
         )
         .slice(0, 8);
 
@@ -578,7 +850,7 @@ const App: React.FC = () => {
     }
   };
 
-  const handleConfirmTransferPreselected = async (selectedResults: LeadQualificationResult[]) => {
+  const handleConfirmTransferPreselected = async (selectedItems: PreparedTransferItem[]) => {
     if (!user || !user.emailVerified) {
       setFirebaseError('Inicia sesión con Google para guardar preselecciones en Firestore.');
       return;
@@ -587,8 +859,13 @@ const App: React.FC = () => {
     setIsTransferringPreselected(true);
     try {
       const existingPlaceIds = new Set(followups.map((f) => f.placeId));
-      const payloadItems = selectedResults.map((res) => {
+      const rawToSeed: GooglePlaceRaw[] = [];
+
+      const payloadItems = selectedItems.map(({ result: res, draft }) => {
         const lead = leads.find((l) => l.placeId === res.placeId);
+        const rawMatch = rawPlaces.find((r) => r.placeId === res.placeId);
+        if (rawMatch) rawToSeed.push(rawMatch);
+
         const aiText = res.geminiAnalysis
           ? [
               res.geminiAnalysis.commercialRelevance,
@@ -600,31 +877,77 @@ const App: React.FC = () => {
               .join(' | ')
           : '';
 
+        const phoneFormatted =
+          analyzePeruvianPhone(draft.independentPhone).formatted || draft.independentPhone.trim();
+
+        const completeness = evaluateFollowupCompleteness({
+          independentBusinessName: draft.independentBusinessName,
+          independentPhone: phoneFormatted,
+          independentAddress: draft.independentAddress,
+          district: draft.district,
+          independentWebsite: draft.independentWebsite,
+          confirmedNoWebsite: draft.confirmedNoWebsite || Boolean(lead?.confirmedNoWebsite),
+          independentEmail: draft.independentEmail,
+          independentCategory: draft.independentCategory,
+        });
+
+        const confirmedNoWeb = draft.confirmedNoWebsite || Boolean(lead?.confirmedNoWebsite);
+        const resolvedWebsiteStatus = resolveIndependentWebsiteStatusForSave({
+          independentWebsite: draft.independentWebsite,
+          confirmedNoWebsite: confirmedNoWeb,
+          verifiedProbe: lead?.websiteProbe,
+        });
+
         return {
           placeId: res.placeId,
-          confirmedNoWebsite: Boolean(lead?.confirmedNoWebsite),
-          independentWebsiteStatus: lead?.websiteProbe.status || 'unregistered',
-          phoneStage: lead?.phoneAnalysis.stage || 'none',
+          independentBusinessName: draft.independentBusinessName,
+          district: draft.district,
+          independentPhone: phoneFormatted,
+          independentPhoneType: resolveIndependentPhoneType(
+            phoneFormatted,
+            draft.independentPhoneType
+          ),
+          independentAddress: draft.independentAddress,
+          independentWebsite: draft.independentWebsite,
+          independentEmail: draft.independentEmail,
+          independentCategory: draft.independentCategory,
+          verificationSummary: draft.verificationSummary,
+          lastVerifiedAt: draft.lastVerifiedAt,
+          verificationSources: draft.verificationSources,
+          confirmedNoWebsite: confirmedNoWeb,
+          independentWebsiteStatus: resolvedWebsiteStatus,
+          phoneStage: phoneFormatted
+            ? ('independently_corroborated' as const)
+            : lead?.phoneAnalysis.stage || 'none',
           independentDigitalScore: res.digitalScore,
           independentContactScore: res.contactabilityScore,
+          independentTrustScore: res.trustScore,
+          completenessStatus: completeness.status,
           stage:
             res.tier === 'PRIORIDAD ALTA'
               ? ('PRESELECCIONADO' as const)
               : ('PENDIENTE DE VERIFICACIÓN' as const),
           qualificationTier: res.tier,
           aiSummary: aiText,
-          notes: res.reasons.join(' '),
+          notes: draft.notes || res.reasons.join(' '),
         };
       });
 
       const outcome = await createBatchPreselectedFollowups(
         user.uid,
         payloadItems,
-        existingPlaceIds
+        existingPlaceIds,
+        workspaceMode
       );
+
+      // Reutilizar los resultados ya cargados en sesión de Explorador sin repetir llamadas Place Details
+      seedSessionHydrationCache(rawToSeed);
+
       setQualifierOpen(false);
       setSearchNotice(
-        `Preselección transferida a Seguimiento: ${outcome.created} nuevos registros guardados por Place ID (${outcome.skippedDuplicates} ya existían en CRM y no se duplicaron).`
+        `Transferencia verificada desde Firestore (${
+          workspaceMode === 'sandbox' ? 'Sandbox Aislado' : 'Seguimiento'
+        }): ${outcome.created} guardadas (${outcome.completeCreated} completas 4/4, ${outcome.partialCreated} incompletas/parciales, ${outcome.skippedDuplicates} ya existían intactas) · 0 llamadas Place Details.`
       );
     } catch (err) {
       setFirebaseError(formatFriendlyFirestoreError(err));
@@ -981,58 +1304,135 @@ const App: React.FC = () => {
           <FollowupCrmView
             isSignedIn={Boolean(user && user.emailVerified)}
             followups={followups}
+            workspaceMode={workspaceMode}
+            onChangeWorkspaceMode={setWorkspaceMode}
+            productionCount={productionFollowups.length}
+            exclusionPlaceIds={exclusionPlaceIds}
+            hydrationCache={hydrationCache}
+            placesQuotaBlock={placesQuotaBlock}
+            quota={quota}
+            onHydratePlaceIds={hydrateFollowupPlaceIds}
+            onRecoverMissingFields={async (proposals) => {
+              if (!user || !user.emailVerified) {
+                throw new Error('Inicia sesión con Google antes de completar fichas en Firestore.');
+              }
+              return recoverMissingFollowupFieldsBatch(user.uid, proposals, workspaceMode);
+            }}
+            onFetchIntegrityBackup={async () => {
+              if (!user || !user.emailVerified) {
+                throw new Error('Inicia sesión con Google antes de verificar el respaldo en Firestore.');
+              }
+              return fetchFollowupsIntegritySnapshot(user.uid, workspaceMode);
+            }}
             onSignIn={handleSignIn}
-            onUpdateFollowup={async (id, updates, currentRecord) => {
+            onUpdateFollowup={async (id, updates, currentRecord): Promise<UpdateFollowupOutcome | void> => {
               if (!user) return;
               try {
-                await updateFollowupRecord(user.uid, id, updates, currentRecord);
+                return await updateFollowupRecord(user.uid, id, updates, currentRecord, workspaceMode);
               } catch (err: any) {
                 setFirebaseError(err?.message || formatFriendlyFirestoreError(err));
               }
             }}
             onCreateManualFollowup={async (payload) => {
               if (!user) return;
+              const nowIso = new Date().toISOString();
               const phoneParsed = analyzePeruvianPhone(payload.independentPhone, payload.phoneStage);
+              const formattedPhone = phoneParsed.formatted || payload.independentPhone;
+              const resolvedWebsiteStatus = resolveIndependentWebsiteStatusForSave({
+                independentWebsite: payload.independentWebsite,
+                confirmedNoWebsite: payload.confirmedNoWebsite,
+                verifiedProbe: null,
+              });
+              const manualProbe = {
+                checkedUrl: payload.independentWebsite || null,
+                finalUrl: null,
+                status: resolvedWebsiteStatus,
+                httpStatus: null,
+                tlsValid: null,
+                isSocialOnly: false,
+                inconclusiveReason: null,
+                summary: payload.confirmedNoWebsite
+                  ? 'Confirmado manualmente sin web'
+                  : payload.independentWebsite
+                  ? 'URL registrada manualmente (pendiente de verificación HTTP)'
+                  : 'Registrado manualmente en CRM',
+                verifiedAt: nowIso,
+                provenance: 'manual_user' as const,
+              };
               const digitalEval = computeDigitalOpportunityScore(
-                {
-                  checkedUrl: null,
-                  finalUrl: null,
-                  status: payload.confirmedNoWebsite ? 'confirmed_none' : 'unregistered',
-                  httpStatus: null,
-                  tlsValid: null,
-                  isSocialOnly: false,
-                  inconclusiveReason: null,
-                  summary: payload.confirmedNoWebsite
-                    ? 'Confirmado manualmente sin web'
-                    : 'Sin web registrada',
-                  verifiedAt: new Date().toISOString(),
-                  provenance: 'manual_user',
-                },
-                payload.confirmedNoWebsite
+                manualProbe,
+                payload.confirmedNoWebsite,
+                { category: payload.independentCategory }
               );
               const contactEval = computeContactabilityScore(
                 phoneParsed,
                 phoneParsed,
-                payload.independentEmail
+                payload.independentEmail,
+                { legalBasis: payload.legalBasis }
               );
-              await createFollowupRecord(user.uid, {
-                placeId: `manual_${Date.now()}`,
-                sourceKind: 'independent_manual',
+              const trustEval = computeInformationTrustScore({
+                businessStatus: 'OPERATIONAL',
                 independentBusinessName: payload.independentBusinessName,
+                independentPhone: formattedPhone,
+                independentAddress: payload.independentAddress,
                 district: payload.district,
+                independentWebsite: payload.independentWebsite,
                 confirmedNoWebsite: payload.confirmedNoWebsite,
-                independentWebsiteStatus: payload.confirmedNoWebsite ? 'confirmed_none' : 'unregistered',
-                independentPhone: phoneParsed.formatted || payload.independentPhone,
-                phoneStage: payload.phoneStage,
-                independentEmail: payload.independentEmail,
-                independentDigitalScore: digitalEval.score,
-                independentContactScore: contactEval.score,
-                stage: 'PENDIENTE DE VERIFICACIÓN',
-                legalBasis: payload.legalBasis,
-                qualificationTier: '',
-                aiSummary: '',
-                notes: payload.notes,
+                independentCategory: payload.independentCategory,
+                websiteProbe: manualProbe,
+                verificationSourcesCount: 1,
+                lastVerifiedAt: nowIso,
               });
+              const completeness = evaluateFollowupCompleteness({
+                independentBusinessName: payload.independentBusinessName,
+                independentPhone: formattedPhone,
+                independentAddress: payload.independentAddress,
+                district: payload.district,
+                independentWebsite: payload.independentWebsite,
+                confirmedNoWebsite: payload.confirmedNoWebsite,
+                independentEmail: payload.independentEmail,
+                independentCategory: payload.independentCategory,
+              });
+              const sources: string[] = [
+                encodeVerificationProvenanceEntry({
+                  field: 'registro',
+                  source: 'user_manual_entry',
+                  evidence: payload.independentBusinessName,
+                  verifiedAt: nowIso,
+                }),
+              ];
+
+              await createFollowupRecord(
+                user.uid,
+                {
+                  placeId: `manual_${Date.now()}`,
+                  sourceKind: 'independent_manual',
+                  independentBusinessName: payload.independentBusinessName,
+                  district: payload.district,
+                  independentAddress: payload.independentAddress,
+                  independentWebsite: payload.independentWebsite,
+                  independentCategory: payload.independentCategory,
+                  confirmedNoWebsite: payload.confirmedNoWebsite,
+                  independentWebsiteStatus: resolvedWebsiteStatus,
+                  independentPhone: formattedPhone,
+                  independentPhoneType: resolveIndependentPhoneType(formattedPhone),
+                  phoneStage: payload.phoneStage,
+                  independentEmail: payload.independentEmail,
+                  independentDigitalScore: digitalEval.score,
+                  independentContactScore: contactEval.score,
+                  independentTrustScore: trustEval.score,
+                  completenessStatus: completeness.status,
+                  stage: 'PENDIENTE DE VERIFICACIÓN',
+                  legalBasis: payload.legalBasis,
+                  qualificationTier: '',
+                  aiSummary: '',
+                  notes: payload.notes,
+                  verificationSummary: 'Registro independiente creado manualmente en Seguimiento.',
+                  lastVerifiedAt: nowIso,
+                  verificationSources: sources,
+                },
+                workspaceMode
+              );
             }}
           />
         )}
@@ -1068,6 +1468,8 @@ const App: React.FC = () => {
 
       <PlaceReviewDrawer
         lead={selectedLead}
+        searchCategory={currentParams?.businessType || ''}
+        searchDistrict={currentParams?.location || ''}
         isSignedIn={Boolean(user && user.emailVerified)}
         verifyingPlaceId={verifyingPlaceId}
         onClose={() => setSelectedPlaceId(null)}
@@ -1085,8 +1487,12 @@ const App: React.FC = () => {
         leads={leads}
         results={qualificationResults}
         summary={qualificationSummary}
+        searchCategory={currentParams?.businessType || ''}
+        searchDistrict={currentParams?.location || ''}
         isSignedIn={Boolean(user && user.emailVerified)}
         isSaving={isTransferringPreselected}
+        workspaceMode={workspaceMode}
+        onChangeWorkspaceMode={setWorkspaceMode}
         onClose={() => setQualifierOpen(false)}
         onConfirmTransfer={handleConfirmTransferPreselected}
       />

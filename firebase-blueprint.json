@@ -132,6 +132,13 @@
         "independentContactScore": {
           "type": "number"
         },
+        "independentTrustScore": {
+          "type": "number"
+        },
+        "completenessStatus": {
+          "type": "string",
+          "enum": ["complete", "partial", "place_id_only"]
+        },
         "stage": {
           "type": "string",
           "enum": [
@@ -161,6 +168,66 @@
         "notes": {
           "type": "string",
           "maxLength": 1000
+        },
+        "independentAddress": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "independentWebsite": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "independentCategory": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "independentPhoneType": {
+          "type": "string",
+          "enum": ["none", "mobile", "landline_lima", "landline_regional", "invalid"]
+        },
+        "verificationSummary": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "lastVerifiedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "verificationSources": {
+          "type": "array",
+          "description": "Lista acotada de procedencia y fecha de verificación independiente por campo (máx 8 entradas)."
+        },
+        "commercialOutcome": {
+          "type": "string",
+          "enum": [
+            "none",
+            "datos_incorrectos",
+            "numero_inexistente",
+            "sin_respuesta",
+            "no_corresponde",
+            "no_interesado",
+            "respondio",
+            "interesado",
+            "cotizacion_enviada",
+            "venta_confirmada",
+            "no_volver_a_contactar"
+          ]
+        },
+        "outcomeSource": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "outcomeContext": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "outcomeRecordedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "outcomeHistory": {
+          "type": "array",
+          "description": "Historial acotado de resultados comerciales reales con fuente, fecha y contexto (máx 10 entradas)."
         },
         "createdAt": {
           "type": "string",
@@ -206,6 +273,10 @@
     "/users/{userId}/followups/{followupId}": {
       "schema": { "$ref": "#/entities/FollowupLeadRecord" },
       "description": "Seguimiento comercial independiente y referencias Place ID privadas por UID autorizado."
+    },
+    "/users/{userId}/sandbox_followups/{followupId}": {
+      "schema": { "$ref": "#/entities/FollowupLeadRecord" },
+      "description": "Espacio aislado de pruebas (FASE 7) bajo idénticas garantías de cumplimiento y seguridad sin tocar los 52 registros de producción."
     }
   }
 }

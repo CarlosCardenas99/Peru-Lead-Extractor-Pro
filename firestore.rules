@@ -73,6 +73,36 @@ service cloud.firestore {
       ];
     }
 
+    function isValidPhoneType(lineType) {
+      return lineType in [
+        'none',
+        'mobile',
+        'landline_lima',
+        'landline_regional',
+        'invalid'
+      ];
+    }
+
+    function isValidCompletenessStatus(status) {
+      return status in ['complete', 'partial', 'place_id_only'];
+    }
+
+    function isValidCommercialOutcome(outcome) {
+      return outcome in [
+        'none',
+        'datos_incorrectos',
+        'numero_inexistente',
+        'sin_respuesta',
+        'no_corresponde',
+        'no_interesado',
+        'respondio',
+        'interesado',
+        'cotizacion_enviada',
+        'venta_confirmada',
+        'no_volver_a_contactar'
+      ];
+    }
+
     function isValidFollowupStage(stage) {
       return stage in [
         'PRESELECCIONADO',
@@ -100,6 +130,31 @@ service cloud.firestore {
 
     function isValidQualificationTier(tier) {
       return tier in ['', 'PRIORIDAD ALTA', 'REVISIÓN PENDIENTE', 'NO ELEGIBLE'];
+    }
+
+    function isValidOptionalIndependentFields(data) {
+      return (!('independentAddress' in data) || (data.independentAddress is string && data.independentAddress.size() <= 200)) &&
+        (!('independentWebsite' in data) || (data.independentWebsite is string && data.independentWebsite.size() <= 300)) &&
+        (!('independentCategory' in data) || (data.independentCategory is string && data.independentCategory.size() <= 120)) &&
+        (!('independentPhoneType' in data) || (data.independentPhoneType is string && isValidPhoneType(data.independentPhoneType))) &&
+        (!('independentTrustScore' in data) || (data.independentTrustScore is number && data.independentTrustScore >= 0 && data.independentTrustScore <= 100)) &&
+        (!('completenessStatus' in data) || (data.completenessStatus is string && isValidCompletenessStatus(data.completenessStatus))) &&
+        (!('verificationSummary' in data) || (data.verificationSummary is string && data.verificationSummary.size() <= 400)) &&
+        (!('lastVerifiedAt' in data) || (data.lastVerifiedAt is string && data.lastVerifiedAt.size() <= 40)) &&
+        (!('verificationSources' in data) || (
+          data.verificationSources is list &&
+          data.verificationSources.size() <= 8 &&
+          (data.verificationSources.size() == 0 || (data.verificationSources[0] is string && data.verificationSources[0].size() <= 240))
+        )) &&
+        (!('commercialOutcome' in data) || (data.commercialOutcome is string && isValidCommercialOutcome(data.commercialOutcome))) &&
+        (!('outcomeSource' in data) || (data.outcomeSource is string && data.outcomeSource.size() <= 120)) &&
+        (!('outcomeContext' in data) || (data.outcomeContext is string && data.outcomeContext.size() <= 300)) &&
+        (!('outcomeRecordedAt' in data) || (data.outcomeRecordedAt is string && data.outcomeRecordedAt.size() <= 40)) &&
+        (!('outcomeHistory' in data) || (
+          data.outcomeHistory is list &&
+          data.outcomeHistory.size() <= 10 &&
+          (data.outcomeHistory.size() == 0 || (data.outcomeHistory[0] is string && data.outcomeHistory[0].size() <= 240))
+        ));
     }
 
     function isValidFollowup(data, userId) {
@@ -137,11 +192,25 @@ service cloud.firestore {
           'independentEmail',
           'independentDigitalScore',
           'independentContactScore',
+          'independentTrustScore',
+          'completenessStatus',
           'stage',
           'legalBasis',
           'qualificationTier',
           'aiSummary',
           'notes',
+          'independentAddress',
+          'independentWebsite',
+          'independentCategory',
+          'independentPhoneType',
+          'verificationSummary',
+          'lastVerifiedAt',
+          'verificationSources',
+          'commercialOutcome',
+          'outcomeSource',
+          'outcomeContext',
+          'outcomeRecordedAt',
+          'outcomeHistory',
           'createdAt',
           'updatedAt'
         ]) &&
@@ -164,8 +233,63 @@ service cloud.firestore {
         data.qualificationTier is string && isValidQualificationTier(data.qualificationTier) &&
         data.aiSummary is string && data.aiSummary.size() <= 800 &&
         data.notes is string && data.notes.size() <= 1000 &&
+        isValidOptionalIndependentFields(data) &&
         data.createdAt is timestamp &&
         data.updatedAt == request.time;
+    }
+
+    function isAllowedFollowupUpdate(userId) {
+      return isValidFollowup(incoming(), userId) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().placeId == existing().placeId &&
+        incoming().sourceKind == existing().sourceKind && (
+          // Action 1: Active pipeline stage, legalBasis, independent verification, outcomes, or contact update
+          (existing().stage != 'CLIENTE' &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'independentBusinessName',
+              'district',
+              'confirmedNoWebsite',
+              'independentWebsiteStatus',
+              'independentPhone',
+              'phoneStage',
+              'independentEmail',
+              'independentDigitalScore',
+              'independentContactScore',
+              'independentTrustScore',
+              'completenessStatus',
+              'stage',
+              'legalBasis',
+              'qualificationTier',
+              'aiSummary',
+              'notes',
+              'independentAddress',
+              'independentWebsite',
+              'independentCategory',
+              'independentPhoneType',
+              'verificationSummary',
+              'lastVerifiedAt',
+              'verificationSources',
+              'commercialOutcome',
+              'outcomeSource',
+              'outcomeContext',
+              'outcomeRecordedAt',
+              'outcomeHistory',
+              'updatedAt'
+            ])) ||
+          // Action 2: Client stage locked; only notes, commercial outcome history & timestamp editable
+          (existing().stage == 'CLIENTE' &&
+            incoming().stage == 'CLIENTE' &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'notes',
+              'commercialOutcome',
+              'outcomeSource',
+              'outcomeContext',
+              'outcomeRecordedAt',
+              'outcomeHistory',
+              'updatedAt'
+            ]))
+        );
     }
 
     match /users/{userId}/exclusions/{exclusionId} {
@@ -190,36 +314,17 @@ service cloud.firestore {
       allow create: if isOwner(userId) && isValidId(followupId) &&
         isValidFollowup(incoming(), userId) &&
         incoming().createdAt == request.time;
-      allow update: if isOwner(userId) && isValidId(followupId) &&
+      allow update: if isOwner(userId) && isValidId(followupId) && isAllowedFollowupUpdate(userId);
+      allow delete: if isOwner(userId) && isValidId(followupId) && existing().ownerUid == request.auth.uid;
+    }
+
+    match /users/{userId}/sandbox_followups/{followupId} {
+      allow get: if isOwner(userId) && isValidId(followupId);
+      allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+      allow create: if isOwner(userId) && isValidId(followupId) &&
         isValidFollowup(incoming(), userId) &&
-        incoming().ownerUid == existing().ownerUid &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().placeId == existing().placeId &&
-        incoming().sourceKind == existing().sourceKind && (
-          // Action 1: Active pipeline stage, legalBasis, independent verification, or contact update
-          (existing().stage != 'CLIENTE' &&
-            incoming().diff(existing()).affectedKeys().hasOnly([
-              'independentBusinessName',
-              'district',
-              'confirmedNoWebsite',
-              'independentWebsiteStatus',
-              'independentPhone',
-              'phoneStage',
-              'independentEmail',
-              'independentDigitalScore',
-              'independentContactScore',
-              'stage',
-              'legalBasis',
-              'qualificationTier',
-              'aiSummary',
-              'notes',
-              'updatedAt'
-            ])) ||
-          // Action 2: Client stage locked; only notes & timestamp editable
-          (existing().stage == 'CLIENTE' &&
-            incoming().stage == 'CLIENTE' &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['notes', 'updatedAt']))
-        );
+        incoming().createdAt == request.time;
+      allow update: if isOwner(userId) && isValidId(followupId) && isAllowedFollowupUpdate(userId);
       allow delete: if isOwner(userId) && isValidId(followupId) && existing().ownerUid == request.auth.uid;
     }
   }

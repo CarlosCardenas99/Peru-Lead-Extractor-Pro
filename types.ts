@@ -62,6 +62,17 @@ export interface ContactabilityEvaluation {
   breakdown: ScoreBreakdownItem[];
 }
 
+export interface InformationTrustEvaluation {
+  score: number;
+  label: string;
+  isOperational: boolean;
+  hasContradictions: boolean;
+  contradictions: string[];
+  missingCoreFields: string[];
+  reasons: string[];
+  breakdown: ScoreBreakdownItem[];
+}
+
 export interface GooglePlaceRaw {
   placeId: string;
   displayName: string;
@@ -86,6 +97,49 @@ export interface HydratedPlaceDetails {
   websiteUri: string | null;
   googleMapsUri: string;
   businessStatus: string | null;
+}
+
+export type PlaceHydrationStatus =
+  | 'idle'
+  | 'loading'
+  | 'loaded'
+  | 'quota_exceeded'
+  | 'local_quota_exceeded'
+  | 'transient_error'
+  | 'unavailable';
+
+export interface PlaceHydrationEntry {
+  placeId: string;
+  status: PlaceHydrationStatus;
+  details: HydratedPlaceDetails | null;
+  errorCode?: string;
+  errorMessage?: string;
+  retryCount: number;
+  updatedAt: number;
+  expiresAt?: number;
+}
+
+export interface PlaceDetailsBatchItemResult {
+  status: 'loaded' | 'unavailable' | 'quota_exceeded' | 'local_quota_exceeded' | 'transient_error';
+  details?: HydratedPlaceDetails;
+  code?: string;
+  message?: string;
+}
+
+export type PlacesQuotaBlockSource = 'none' | 'google_resource_exhausted' | 'local_preventive_limit';
+
+export interface PlacesQuotaBlockState {
+  blocked: boolean;
+  source: PlacesQuotaBlockSource;
+  message: string | null;
+}
+
+export interface FollowupIntegrityReport {
+  totalDocuments: number;
+  uniqueDocIds: number;
+  uniquePlaceIds: number;
+  records: FollowupLeadRecord[];
+  backedUpAt: string;
 }
 
 export interface BusinessLead {
@@ -115,6 +169,7 @@ export interface BusinessLead {
   independentWebsiteNote: string;
   digitalScore: DigitalOpportunityEvaluation;
   contactabilityScore: ContactabilityEvaluation;
+  trustScore: InformationTrustEvaluation;
   exclusionMatch: {
     excluded: boolean;
     matchedRule: string | null;
@@ -204,6 +259,57 @@ export type FollowupSourceKind = 'places_preselection' | 'independent_manual';
 
 export type QualificationTier = 'PRIORIDAD ALTA' | 'REVISIÓN PENDIENTE' | 'NO ELEGIBLE';
 
+export type CrmWorkspaceMode = 'production' | 'sandbox';
+
+export type CommercialOutcomeType =
+  | 'none'
+  | 'datos_incorrectos'
+  | 'numero_inexistente'
+  | 'sin_respuesta'
+  | 'no_corresponde'
+  | 'no_interesado'
+  | 'respondio'
+  | 'interesado'
+  | 'cotizacion_enviada'
+  | 'venta_confirmada'
+  | 'no_volver_a_contactar';
+
+export interface CommercialOutcomeOption {
+  value: CommercialOutcomeType;
+  label: string;
+  isNegativeContactSignal: boolean;
+  isPositiveOutcome: boolean;
+}
+
+export const COMMERCIAL_OUTCOME_OPTIONS: CommercialOutcomeOption[] = [
+  { value: 'none', label: 'Sin resultado registrado', isNegativeContactSignal: false, isPositiveOutcome: false },
+  { value: 'datos_incorrectos', label: 'Datos incorrectos', isNegativeContactSignal: true, isPositiveOutcome: false },
+  { value: 'numero_inexistente', label: 'Número inexistente', isNegativeContactSignal: true, isPositiveOutcome: false },
+  { value: 'sin_respuesta', label: 'Número sin respuesta', isNegativeContactSignal: false, isPositiveOutcome: false },
+  { value: 'no_corresponde', label: 'No corresponde al negocio', isNegativeContactSignal: true, isPositiveOutcome: false },
+  { value: 'no_interesado', label: 'No interesado', isNegativeContactSignal: false, isPositiveOutcome: false },
+  { value: 'respondio', label: 'Respondió', isNegativeContactSignal: false, isPositiveOutcome: true },
+  { value: 'interesado', label: 'Interesado', isNegativeContactSignal: false, isPositiveOutcome: true },
+  { value: 'cotizacion_enviada', label: 'Cotización enviada', isNegativeContactSignal: false, isPositiveOutcome: true },
+  { value: 'venta_confirmada', label: 'Venta confirmada', isNegativeContactSignal: false, isPositiveOutcome: true },
+  { value: 'no_volver_a_contactar', label: 'No volver a contactar', isNegativeContactSignal: true, isPositiveOutcome: false },
+];
+
+export interface OutcomeCalibrationStats {
+  reviewedCount: number;
+  corroboratedCount: number;
+  legallyAuthorizedCount: number;
+  reachedCount: number;
+  effectiveResponsesCount: number;
+  interestedCount: number;
+  quotationsCount: number;
+  confirmedSalesCount: number;
+  negativeOutcomesCount: number;
+  sampleSizeSufficient: boolean;
+  minimumSampleThreshold: number;
+  insights: string[];
+}
+
 export interface GeminiComplementaryAnalysis {
   placeId: string;
   digitalNeeds: string[];
@@ -211,6 +317,8 @@ export interface GeminiComplementaryAnalysis {
   commercialRelevance: string;
   missingInformation: string[];
   manualVerificationSteps: string[];
+  contradictions?: string[];
+  observedEvidence?: string[];
   analyzedSourceNote: string;
 }
 
@@ -219,6 +327,10 @@ export interface LeadQualificationResult {
   tier: QualificationTier;
   digitalScore: number;
   contactabilityScore: number;
+  trustScore: number;
+  combinedPriorityScore: number;
+  isFichaCompleta: boolean;
+  contradictions: string[];
   reasons: string[];
   missingInformation: string[];
   isLandlineOnly: boolean;
@@ -239,6 +351,57 @@ export interface QualifierBatchSummary {
   alreadyInCrmSkippedCount: number;
 }
 
+export type IndependentFieldSource =
+  | 'official_website_jsonld'
+  | 'official_website_html'
+  | 'authorized_public_source'
+  | 'user_manual_entry'
+  | 'phone_call_verified'
+  | 'user_search_context'
+  | 'ssrf_http_probe'
+  | 'none';
+
+export type GooglePlacesStoragePolicy =
+  | 'PERMITTED_PERMANENT_ID'
+  | 'SESSION_MEMORY_ONLY'
+  | 'PROHIBITED_PERMANENT_STORAGE'
+  | 'PERMITTED_INDEPENDENT_SOURCE';
+
+export interface CorroboratedFieldCandidate<T = string> {
+  value: T;
+  source: IndependentFieldSource;
+  evidenceUrl: string | null;
+  verifiedAt: string;
+  confidence: 'high' | 'medium';
+}
+
+export interface IndependentCorroborationResult {
+  placeId: string;
+  checkedUrls: string[];
+  websiteStatus: WebsiteVerificationStatus;
+  completeness: 'complete' | 'partial' | 'insufficient';
+  summary: string;
+  candidates: {
+    businessName: CorroboratedFieldCandidate<string> | null;
+    phone: CorroboratedFieldCandidate<string> | null;
+    phoneType: CorroboratedFieldCandidate<PhoneLineType> | null;
+    address: CorroboratedFieldCandidate<string> | null;
+    district: CorroboratedFieldCandidate<string> | null;
+    website: CorroboratedFieldCandidate<string> | null;
+    email: CorroboratedFieldCandidate<string> | null;
+    category: CorroboratedFieldCandidate<string> | null;
+  };
+}
+
+export interface FollowupCompletenessInfo {
+  status: 'complete' | 'partial' | 'place_id_only';
+  isFichaIncompleta: boolean;
+  label: string;
+  presentFields: string[];
+  missingFields: string[];
+  percent: number;
+}
+
 export interface FollowupLeadRecord {
   id: string;
   ownerUid: string;
@@ -253,11 +416,26 @@ export interface FollowupLeadRecord {
   independentEmail: string;
   independentDigitalScore: number;
   independentContactScore: number;
+  independentTrustScore?: number;
+  completenessStatus?: 'complete' | 'partial' | 'place_id_only';
   stage: FollowupStage;
   legalBasis: string;
   qualificationTier: QualificationTier | '';
   aiSummary: string;
   notes: string;
+  // Campos comerciales, resultados y procedencia independientes opcionales (retrocompatibles con los 52 documentos existentes)
+  independentAddress?: string;
+  independentWebsite?: string;
+  independentCategory?: string;
+  independentPhoneType?: PhoneLineType;
+  verificationSummary?: string;
+  lastVerifiedAt?: string;
+  verificationSources?: string[];
+  commercialOutcome?: CommercialOutcomeType;
+  outcomeSource?: string;
+  outcomeContext?: string;
+  outcomeRecordedAt?: string;
+  outcomeHistory?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -283,6 +461,9 @@ export interface QuotaStatus {
   dateLima: string;
   placesUsed: number;
   placesLimit: number;
+  placesFailed?: number;
+  googleQuotaBlocked?: boolean;
+  googleQuotaBlockedMessage?: string | null;
   geminiUsed: number;
   geminiLimit: number;
   note: string;

@@ -3,11 +3,20 @@ import path from 'node:path';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { DailyQuotaGuard } from './server/quotaGuard';
-import { getPlaceDetailsById, PlacesApiError, searchPlacesNewApi } from './server/placesService';
+import {
+  getPlaceDetailsByIdWithStatus,
+  PlacesApiError,
+  searchPlacesNewApi,
+} from './server/placesService';
 import { verifyWebsiteIndependently } from './server/websiteVerifier';
+import { corroborateLeadIndependently } from './server/independentCorroborator';
 import { GeminiSubzoneError, suggestPeruvianSubzones } from './server/geminiSubzoneService';
 import { extractWebsiteMetadataSafe } from './server/websiteMetadataExtractor';
-import { analyzeCandidatesWithGemini, GeminiAnalystError } from './server/geminiAnalystService';
+import {
+  analyzeCandidatesWithGemini,
+  GeminiAnalystError,
+  hasSubstantiveIndependentEvidence,
+} from './server/geminiAnalystService';
 
 function loadEnvFileIfPresent(filename: string) {
   const filePath = path.resolve(process.cwd(), filename);
@@ -30,9 +39,9 @@ function loadEnvFileIfPresent(filename: string) {
 loadEnvFileIfPresent('.env.local');
 loadEnvFileIfPresent('.env');
 
-const quotaGuard = new DailyQuotaGuard();
+const defaultQuotaGuard = new DailyQuotaGuard();
 
-export function createApiApp() {
+export function createApiApp(quotaGuard: DailyQuotaGuard = defaultQuotaGuard) {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
@@ -105,17 +114,29 @@ export function createApiApp() {
         });
       }
 
-      if (!quotaGuard.canUsePlaces()) {
+      if (quotaGuard.isGoogleQuotaBlocked()) {
         return res.status(429).json({
-          code: 'LOCAL_DAILY_QUOTA_REACHED',
+          code: 'PLACES_QUOTA_EXCEEDED',
+          quotaSource: 'google_resource_exhausted',
           message:
-            'Se alcanzó el límite diario preventivo de consultas a Places API (New) para proteger la cuota gratuita. Los resultados en caché siguen disponibles.',
+            quotaGuard.getGoogleQuotaBlockMessage() ||
+            'Google Places API (New) reportó cuota agotada (429 RESOURCE_EXHAUSTED). Consultas pausadas hasta que Google restablezca la cuota de la clave/proyecto.',
           quota: quotaGuard.getStatus(),
         });
       }
 
-      quotaGuard.consumePlaces();
+      if (quotaGuard.hasReachedLocalPlacesLimit()) {
+        return res.status(429).json({
+          code: 'LOCAL_DAILY_QUOTA_REACHED',
+          quotaSource: 'local_preventive_limit',
+          message:
+            'Se alcanzó el límite diario preventivo local de consultas a Places API (New). Los resultados en caché siguen disponibles.',
+          quota: quotaGuard.getStatus(),
+        });
+      }
+
       const result = await searchPlacesNewApi({ textQuery, pageToken, pageSize: 20 });
+      quotaGuard.recordPlacesSuccess();
 
       quotaGuard.setCached(cacheKey, {
         places: result.places,
@@ -131,12 +152,24 @@ export function createApiApp() {
       });
     } catch (err: any) {
       if (err instanceof PlacesApiError) {
+        if (err.status === 429 || err.code === 'PLACES_QUOTA_EXCEEDED') {
+          quotaGuard.recordPlacesFailure('google_quota', err.message);
+          return res.status(429).json({
+            code: 'PLACES_QUOTA_EXCEEDED',
+            quotaSource: 'google_resource_exhausted',
+            message: err.message,
+            quota: quotaGuard.getStatus(),
+          });
+        }
+        quotaGuard.recordPlacesFailure('error', err.message);
         return res.status(err.status).json({
           code: err.code,
+          quotaSource: 'none',
           message: err.message,
           quota: quotaGuard.getStatus(),
         });
       }
+      quotaGuard.recordPlacesFailure('error', err?.message);
       return res.status(500).json({
         code: 'PLACES_INTERNAL_ERROR',
         message: err?.message || 'Error inesperado consultando Places API (New).',
@@ -163,6 +196,48 @@ export function createApiApp() {
     const probe = await verifyWebsiteIndependently(rawUrl);
     quotaGuard.setCached(cacheKey, probe);
     return res.json(probe);
+  });
+
+  app.post('/api/corroborate-independent', async (req, res) => {
+    const rawItems: unknown[] = Array.isArray(req.body?.items) ? req.body.items.slice(0, 10) : [];
+    if (rawItems.length === 0) {
+      return res.json({ results: [] });
+    }
+
+    const results = await Promise.all(
+      rawItems.map(async (raw: any) => {
+        const placeId = String(raw?.placeId || '').trim();
+        const officialWebsiteUrl =
+          typeof raw?.officialWebsiteUrl === 'string' ? raw.officialWebsiteUrl.trim().slice(0, 500) : '';
+        const notesText = typeof raw?.notesText === 'string' ? raw.notesText.slice(0, 1000) : '';
+        const searchCategory =
+          typeof raw?.searchCategory === 'string' ? raw.searchCategory.trim().slice(0, 120) : '';
+        const searchDistrict =
+          typeof raw?.searchDistrict === 'string' ? raw.searchDistrict.trim().slice(0, 120) : '';
+
+        const cacheKey = officialWebsiteUrl
+          ? `corrob:${placeId}:${officialWebsiteUrl.toLowerCase()}:${searchCategory.toLowerCase()}:${searchDistrict.toLowerCase()}`
+          : '';
+        if (cacheKey) {
+          const cached = quotaGuard.getCached(cacheKey);
+          if (cached) return cached;
+        }
+
+        const result = await corroborateLeadIndependently({
+          placeId,
+          officialWebsiteUrl,
+          notesText,
+          searchCategory,
+          searchDistrict,
+        });
+        if (cacheKey) {
+          quotaGuard.setCached(cacheKey, result);
+        }
+        return result;
+      })
+    );
+
+    return res.json({ results });
   });
 
   app.post('/api/subzones', async (req, res) => {
@@ -290,8 +365,34 @@ export function createApiApp() {
         })
       );
 
+      const valuableCandidates = prepared.filter((c) => hasSubstantiveIndependentEvidence(c));
+      if (valuableCandidates.length === 0) {
+        return res.json({
+          analyses: [],
+          modelUsed: 'skipped_no_independent_evidence',
+          warning: null,
+          quota: quotaGuard.getStatus(),
+        });
+      }
+
+      const geminiCacheKey = `gemini_analyze:${JSON.stringify(valuableCandidates)}`;
+      const cachedAnalyses = quotaGuard.getCached<{
+        analyses: unknown[];
+        modelUsed: string;
+      }>(geminiCacheKey);
+      if (cachedAnalyses) {
+        return res.json({
+          analyses: cachedAnalyses.analyses,
+          modelUsed: cachedAnalyses.modelUsed,
+          fromCache: true,
+          warning: null,
+          quota: quotaGuard.getStatus(),
+        });
+      }
+
       quotaGuard.consumeGemini();
-      const result = await analyzeCandidatesWithGemini(prepared);
+      const result = await analyzeCandidatesWithGemini(valuableCandidates);
+      quotaGuard.setCached(geminiCacheKey, result);
 
       return res.json({
         analyses: result.analyses,
@@ -327,43 +428,133 @@ export function createApiApp() {
             .map((id) => id.trim())
             .filter((id) => /^[a-zA-Z0-9_-]+$/.test(id) && !id.startsWith('manual_'))
         )
-      ).slice(0, 10);
+      ).slice(0, 5);
 
       if (uniqueIds.length === 0) {
-        return res.json({ details: {}, quota: quotaGuard.getStatus() });
-      }
-
-      const details: Record<string, unknown> = {};
-      for (const placeId of uniqueIds) {
-        const cacheKey = `placedetails:${placeId}`;
-        const cached = quotaGuard.getCached(cacheKey);
-        if (cached) {
-          details[placeId] = cached;
-          continue;
-        }
-        if (!quotaGuard.canUsePlaces()) {
-          break;
-        }
-        quotaGuard.consumePlaces();
-        const fetched = await getPlaceDetailsById(placeId);
-        if (fetched) {
-          quotaGuard.setCached(cacheKey, fetched);
-          details[placeId] = fetched;
-        }
-      }
-
-      return res.json({ details, quota: quotaGuard.getStatus() });
-    } catch (err: any) {
-      if (err instanceof PlacesApiError) {
-        return res.status(err.status).json({
-          code: err.code,
-          message: err.message,
+        return res.json({
+          details: {},
+          results: {},
+          quotaExceeded: quotaGuard.isGoogleQuotaBlocked(),
+          localQuotaReached: quotaGuard.hasReachedLocalPlacesLimit(),
           quota: quotaGuard.getStatus(),
         });
       }
+
+      const details: Record<string, unknown> = {};
+      const results: Record<
+        string,
+        {
+          status:
+            | 'loaded'
+            | 'unavailable'
+            | 'quota_exceeded'
+            | 'local_quota_exceeded'
+            | 'transient_error';
+          details?: unknown;
+          code?: string;
+          message?: string;
+        }
+      > = {};
+
+      for (const placeId of uniqueIds) {
+        const cacheKey = `placedetails:${placeId}`;
+        const cached = quotaGuard.getCached<any>(cacheKey);
+        if (cached) {
+          if (cached.__unavailable) {
+            results[placeId] = {
+              status: 'unavailable',
+              code: 'PLACE_NOT_FOUND',
+              message: 'Establecimiento no disponible en Google Places.',
+            };
+          } else {
+            details[placeId] = cached;
+            results[placeId] = { status: 'loaded', details: cached };
+          }
+          continue;
+        }
+
+        if (quotaGuard.isGoogleQuotaBlocked()) {
+          results[placeId] = {
+            status: 'quota_exceeded',
+            code: 'PLACES_QUOTA_EXCEEDED',
+            message:
+              quotaGuard.getGoogleQuotaBlockMessage() ||
+              'Cuota real de Google Places API (New) agotada (429 RESOURCE_EXHAUSTED).',
+          };
+          continue;
+        }
+
+        if (quotaGuard.hasReachedLocalPlacesLimit()) {
+          results[placeId] = {
+            status: 'local_quota_exceeded',
+            code: 'LOCAL_DAILY_QUOTA_REACHED',
+            message:
+              'Límite preventivo diario local alcanzado en el servidor. Los datos ya cargados siguen disponibles en caché.',
+          };
+          continue;
+        }
+
+        try {
+          const outcome = await getPlaceDetailsByIdWithStatus(placeId);
+          if (outcome.status === 'loaded') {
+            quotaGuard.recordPlacesSuccess();
+            quotaGuard.setCached(cacheKey, outcome.details);
+            details[placeId] = outcome.details;
+            results[placeId] = { status: 'loaded', details: outcome.details };
+          } else {
+            quotaGuard.recordPlacesFailure('error', 'PLACE_NOT_FOUND');
+            quotaGuard.setCached(cacheKey, { __unavailable: true });
+            results[placeId] = {
+              status: 'unavailable',
+              code: 'PLACE_NOT_FOUND',
+              message: 'Establecimiento no disponible o eliminado de Google Places.',
+            };
+          }
+        } catch (itemErr: any) {
+          if (
+            itemErr instanceof PlacesApiError &&
+            (itemErr.status === 429 || itemErr.code === 'PLACES_QUOTA_EXCEEDED')
+          ) {
+            quotaGuard.recordPlacesFailure('google_quota', itemErr.message);
+            results[placeId] = {
+              status: 'quota_exceeded',
+              code: itemErr.code,
+              message: itemErr.message,
+            };
+          } else {
+            quotaGuard.recordPlacesFailure('error', itemErr?.message);
+            results[placeId] = {
+              status: 'transient_error',
+              code: itemErr?.code || 'PLACE_DETAILS_ERROR',
+              message: itemErr?.message || 'Error temporal consultando Google Places.',
+            };
+          }
+        }
+      }
+
+      const googleBlocked = quotaGuard.isGoogleQuotaBlocked();
+      const localBlocked = quotaGuard.hasReachedLocalPlacesLimit();
+
+      return res.json({
+        details,
+        results,
+        quotaExceeded: googleBlocked,
+        localQuotaReached: localBlocked,
+        quotaSource: googleBlocked
+          ? 'google_resource_exhausted'
+          : localBlocked
+          ? 'local_preventive_limit'
+          : 'none',
+        quota: quotaGuard.getStatus(),
+      });
+    } catch (err: any) {
       return res.status(500).json({
         code: 'PLACE_DETAILS_INTERNAL_ERROR',
-        message: err?.message || 'Error al hidratar detalles desde Places API.',
+        message: err?.message || 'Error inesperado al hidratar detalles desde Places API.',
+        details: {},
+        results: {},
+        quotaExceeded: quotaGuard.isGoogleQuotaBlocked(),
+        localQuotaReached: quotaGuard.hasReachedLocalPlacesLimit(),
         quota: quotaGuard.getStatus(),
       });
     }

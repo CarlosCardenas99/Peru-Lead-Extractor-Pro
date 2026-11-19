@@ -49,10 +49,10 @@ export const SmartFilterBar: React.FC<SmartFilterBarProps> = ({
           <Filter className="w-4 h-4 text-purple-700 mt-0.5 shrink-0" />
           <div>
             <h3 className="text-sm font-semibold text-slate-900">
-              Filtros Inteligentes Combinables · WEBNEX Smart Lead Qualifier
+              Filtros Inteligentes Combinables · WEBNEX Smart Qualifier 2.0
             </h3>
             <p className="text-xs text-slate-500 mt-0.5">
-              Un formato peruano válido no demuestra que el número esté activo, pertenezca al propietario o tenga WhatsApp.
+              Evalúa Necesidad Digital, Calidad de Contacto y Confianza. Un formato peruano válido no demuestra número activo ni WhatsApp.
             </p>
           </div>
         </div>

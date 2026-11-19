@@ -56,7 +56,8 @@ export const LeadTable: React.FC<LeadTableProps> = ({
             <th className="py-3 px-3 font-semibold text-xs">Estado Web e Independencia</th>
             <th className="py-3 px-3 font-semibold text-xs">Teléfono y Verificación</th>
             <th className="py-3 px-3 font-semibold text-xs text-right">Oport. Digital</th>
-            <th className="py-3 px-3 font-semibold text-xs text-right">Contactabilidad</th>
+            <th className="py-3 px-3 font-semibold text-xs text-right">Calidad Contacto</th>
+            <th className="py-3 px-3 font-semibold text-xs text-right">Confianza Info</th>
             <th className="py-3 px-3 font-semibold text-xs text-right">Acciones</th>
           </tr>
         </thead>
@@ -70,6 +71,8 @@ export const LeadTable: React.FC<LeadTableProps> = ({
               lead.phoneAnalysis.stage === 'contact_reached'
                 ? lead.phoneAnalysis.stage
                 : lead.phoneAnalysis.stage;
+            const isClosedTemp = lead.businessStatus === 'CLOSED_TEMPORARILY';
+            const isClosedPerm = lead.businessStatus === 'CLOSED_PERMANENTLY';
 
             return (
               <tr
@@ -86,10 +89,22 @@ export const LeadTable: React.FC<LeadTableProps> = ({
                   <div className="text-xs text-slate-500 mt-0.5 truncate" title={lead.address}>
                     {lead.address}
                   </div>
-                  <div className="mt-1 flex items-center gap-1.5 text-[11px] text-slate-500 font-mono-tabular">
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500 font-mono-tabular">
                     <span>★ {lead.rating}</span>
                     <span aria-hidden="true">·</span>
                     <span>{lead.reviews} reseñas</span>
+                    {isClosedPerm && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-rose-700 font-semibold">Cerrado perm.</span>
+                      </>
+                    )}
+                    {isClosedTemp && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-amber-700 font-semibold">Cerrado temp.</span>
+                      </>
+                    )}
                     {lead.exclusionMatch.excluded && (
                       <>
                         <span aria-hidden="true">·</span>
@@ -151,6 +166,29 @@ export const LeadTable: React.FC<LeadTableProps> = ({
                     {lead.contactabilityScore.isIndependentlyCorroborated
                       ? 'Corroborado'
                       : 'Ref. Google'}
+                  </div>
+                </td>
+
+                <td className="py-3 px-3 align-top text-right">
+                  <div
+                    className={`text-sm font-semibold font-mono-tabular ${
+                      lead.trustScore.hasContradictions
+                        ? 'text-rose-700'
+                        : lead.trustScore.score >= 75
+                        ? 'text-emerald-700'
+                        : 'text-slate-700'
+                    }`}
+                  >
+                    {lead.trustScore.score}/100
+                  </div>
+                  <div className="text-[11px] text-slate-500">
+                    {lead.trustScore.hasContradictions
+                      ? 'Con alertas'
+                      : lead.trustScore.score >= 75
+                      ? 'Alta'
+                      : lead.trustScore.score >= 45
+                      ? 'Media'
+                      : 'Por corroborar'}
                   </div>
                 </td>
 

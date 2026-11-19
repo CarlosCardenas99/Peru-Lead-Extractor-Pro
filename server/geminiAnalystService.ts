@@ -49,6 +49,16 @@ export function sanitizeAnalystInput(candidate: GeminiAnalystCandidateInput): Ge
   };
 }
 
+/**
+ * FASE 5: Decide si existe información independiente real suficiente que justifique invocar Gemini.
+ * Evita gastar cuota en fichas sin metadatos HTML propios ni notas independientes del usuario.
+ */
+export function hasSubstantiveIndependentEvidence(candidate: GeminiAnalystCandidateInput): boolean {
+  const hasOkWebMeta = candidate.websiteMeta?.extractionStatus === 'ok';
+  const hasSubstantiveNotes = (candidate.userNotes || '').trim().length >= 15;
+  return Boolean(hasOkWebMeta || hasSubstantiveNotes);
+}
+
 export function parseGeminiAnalystResponse(
   rawText: string | undefined,
   allowedPlaceIds: Set<string>
@@ -97,6 +107,8 @@ export function parseGeminiAnalystResponse(
           : 'Relevancia sujeta a verificación manual.',
       missingInformation: toStringArray(obj.missingInformation, 4),
       manualVerificationSteps: toStringArray(obj.manualVerificationSteps, 4),
+      contradictions: toStringArray(obj.contradictions, 3),
+      observedEvidence: toStringArray(obj.observedEvidence, 4),
       analyzedSourceNote:
         typeof obj.analyzedSourceNote === 'string'
           ? obj.analyzedSourceNote.trim().slice(0, 140)
@@ -126,10 +138,10 @@ export async function analyzeCandidatesWithGemini(
   const safeCandidates = candidatesInput
     .slice(0, 8)
     .map(sanitizeAnalystInput)
-    .filter((c) => c.placeId.length > 0);
+    .filter((c) => c.placeId.length > 0 && hasSubstantiveIndependentEvidence(c));
 
   if (safeCandidates.length === 0) {
-    return { analyses: [], modelUsed: 'none' };
+    return { analyses: [], modelUsed: 'skipped_no_independent_evidence' };
   }
 
   const allowedPlaceIds = new Set(safeCandidates.map((c) => c.placeId));
@@ -142,15 +154,16 @@ export async function analyzeCandidatesWithGemini(
     },
   });
 
-  const prompt = `Evalúa técnicamente estos registros comerciales para WEBNEX SYSTEMS (agencia de diseño web, desarrollo a medida, SEO técnico y digitalización en Perú) utilizando ÚNICAMENTE los datos técnicos y notas independientes proporcionadas aquí:
+  const prompt = `Evalúa técnicamente estos registros comerciales para WEBNEX SYSTEMS (agencia de diseño web, desarrollo a medida, SEO técnico y digitalización en Perú) utilizando ÚNICAMENTE la evidencia técnica y notas independientes proporcionadas aquí:
 
 ${JSON.stringify(safeCandidates, null, 2)}
 
-REGLAS ESTRICTAS:
-1. NUNCA inventes nombres de empresas, teléfonos, sitios web, reseñas ni probabilidades de compra (%).
-2. Señala necesidades digitales concretas basadas en el estado web real o metadatos HTML observados (ej. falta de HTTPS, sin meta viewport móvil, ausencia de descripción SEO, uso de plataforma gratuita o web caída).
-3. Sugiere servicios específicos de WEBNEX SYSTEMS compatibles con el rubro y el diagnóstico técnico.
-4. Indica qué información falta comprobar manualmente antes de contactar (ej. confirmar dominio propio o autorización de contacto).`;
+REGLAS ESTRICTAS DE CUMPLIMIENTO Y PRECISIÓN (PROHIBICIONES):
+1. NUNCA inventes teléfonos, nombres de propietarios, correos, sitios web ni probabilidades o porcentajes de compra/conversión.
+2. NUNCA afirmes que un número funciona, está activo o tiene WhatsApp sin evidencia real.
+3. Identifica necesidades digitales concretas basadas en la evidencia observada (ej. falta de HTTPS, sin meta viewport móvil, ausencia de meta description SEO, CMS básico o notas de verificación).
+4. Relaciona hallazgos con servicios específicos compatibles de WEBNEX SYSTEMS.
+5. Señala contradicciones detectadas (si existieran) y lista explícitamente qué falta verificar manualmente antes de contactar.`;
 
   const responseSchema = {
     type: Type.OBJECT,
@@ -178,6 +191,14 @@ REGLAS ESTRICTAS:
               type: Type.ARRAY,
               items: { type: Type.STRING },
             },
+            contradictions: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+            },
+            observedEvidence: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+            },
             analyzedSourceNote: { type: Type.STRING },
           },
           required: [
@@ -187,6 +208,8 @@ REGLAS ESTRICTAS:
             'commercialRelevance',
             'missingInformation',
             'manualVerificationSteps',
+            'contradictions',
+            'observedEvidence',
             'analyzedSourceNote',
           ],
         },
@@ -227,7 +250,7 @@ REGLAS ESTRICTAS:
           contents: prompt,
           config: {
             systemInstruction:
-              'Eres un analista técnico comercial de WEBNEX SYSTEMS. Solo analizas datos técnicos web y notas independientes; nunca inventas datos ni probabilidades de compra.',
+              'Eres un analista técnico comercial de WEBNEX SYSTEMS. Solo analizas datos técnicos web y notas independientes; nunca inventas teléfonos, dueños, WhatsApp, ni probabilidades porcentuales de compra.',
             ...(candidate.useLowThinking
               ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
               : {}),

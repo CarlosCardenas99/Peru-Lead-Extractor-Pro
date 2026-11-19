@@ -10,6 +10,9 @@ export class DailyQuotaGuard {
   private geminiLimit: number;
   private currentDay: string;
   private placesUsed = 0;
+  private placesFailed = 0;
+  private googleQuotaBlocked = false;
+  private googleQuotaBlockedMessage: string | null = null;
   private geminiUsed = 0;
   private cache = new Map<string, CacheEntry<unknown>>();
   private cacheTtlMs: number;
@@ -17,6 +20,7 @@ export class DailyQuotaGuard {
   constructor(options?: { placesLimit?: number; geminiLimit?: number; cacheTtlMs?: number }) {
     this.placesLimit = options?.placesLimit ?? Number(process.env.PLACES_DAILY_LIMIT || 60);
     this.geminiLimit = options?.geminiLimit ?? Number(process.env.GEMINI_DAILY_LIMIT || 40);
+    // Session/server memory cache max 30 min (never persisted to disk/DB, compatible with GMP ToS)
     this.cacheTtlMs = options?.cacheTtlMs ?? 30 * 60 * 1000;
     this.currentDay = this.getLimaDate();
   }
@@ -35,6 +39,9 @@ export class DailyQuotaGuard {
     if (today !== this.currentDay) {
       this.currentDay = today;
       this.placesUsed = 0;
+      this.placesFailed = 0;
+      this.googleQuotaBlocked = false;
+      this.googleQuotaBlockedMessage = null;
       this.geminiUsed = 0;
       this.cache.clear();
     }
@@ -61,12 +68,50 @@ export class DailyQuotaGuard {
 
   canUsePlaces(): boolean {
     this.rolloverIfNewDay();
-    return this.placesUsed < this.placesLimit;
+    return !this.googleQuotaBlocked && this.placesUsed < this.placesLimit;
   }
 
-  consumePlaces(): void {
+  hasReachedLocalPlacesLimit(): boolean {
+    this.rolloverIfNewDay();
+    return this.placesUsed >= this.placesLimit;
+  }
+
+  isGoogleQuotaBlocked(): boolean {
+    this.rolloverIfNewDay();
+    return this.googleQuotaBlocked;
+  }
+
+  getGoogleQuotaBlockMessage(): string | null {
+    this.rolloverIfNewDay();
+    return this.googleQuotaBlockedMessage;
+  }
+
+  /**
+   * Contabiliza únicamente solicitudes Places completadas con respuesta válida.
+   */
+  recordPlacesSuccess(): void {
     this.rolloverIfNewDay();
     this.placesUsed++;
+  }
+
+  /**
+   * Registra una solicitud Places fallida SIN sumarla al contador de recuperaciones exitosas.
+   * Si el motivo es 429 / RESOURCE_EXHAUSTED de Google, activa el bloqueo inmediato para detener consultas.
+   */
+  recordPlacesFailure(reason: 'google_quota' | 'error', message?: string): void {
+    this.rolloverIfNewDay();
+    this.placesFailed++;
+    if (reason === 'google_quota') {
+      this.googleQuotaBlocked = true;
+      this.googleQuotaBlockedMessage =
+        message ||
+        'Google Places API (New) devolvió 429 RESOURCE_EXHAUSTED (cuota real de Google agotada).';
+    }
+  }
+
+  // Compatibilidad con llamadas existentes que consumen cuota preventiva explícita
+  consumePlaces(): void {
+    this.recordPlacesSuccess();
   }
 
   canUseGemini(): boolean {
@@ -85,9 +130,12 @@ export class DailyQuotaGuard {
       dateLima: this.currentDay,
       placesUsed: this.placesUsed,
       placesLimit: this.placesLimit,
+      placesFailed: this.placesFailed,
+      googleQuotaBlocked: this.googleQuotaBlocked,
+      googleQuotaBlockedMessage: this.googleQuotaBlockedMessage,
       geminiUsed: this.geminiUsed,
       geminiLimit: this.geminiLimit,
-      note: 'Límite diario local de protección de cuota gratuita (Google AI Plus no incluye llamadas API ilimitadas).',
+      note: 'El contador local mide únicamente llamadas exitosas de esta instancia de servidor y es independiente de la cuota real diaria asignada en Google Maps Platform.',
     };
   }
 }

@@ -146,12 +146,18 @@ export const MINIMAL_PLACE_DETAILS_FIELD_MASK = [
   'businessStatus',
 ].join(',');
 
-export async function getPlaceDetailsById(
+export type PlaceDetailsLookupOutcome =
+  | { status: 'loaded'; details: import('../types').HydratedPlaceDetails }
+  | { status: 'unavailable' };
+
+export async function getPlaceDetailsByIdWithStatus(
   placeId: string,
   opts?: { apiKey?: string; fetchFn?: typeof fetch }
-): Promise<import('../types').HydratedPlaceDetails | null> {
+): Promise<PlaceDetailsLookupOutcome> {
   const cleanId = (placeId || '').trim();
-  if (!cleanId || !/^[a-zA-Z0-9_-]+$/.test(cleanId)) return null;
+  if (!cleanId || !/^[a-zA-Z0-9_-]+$/.test(cleanId)) {
+    return { status: 'unavailable' };
+  }
 
   const apiKey =
     opts?.apiKey ||
@@ -171,35 +177,79 @@ export async function getPlaceDetailsById(
   url.searchParams.set('languageCode', 'es');
   url.searchParams.set('regionCode', 'PE');
 
-  const response = await fetchFn(url.toString(), {
-    method: 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Goog-Api-Key': apiKey,
-      'X-Goog-FieldMask': MINIMAL_PLACE_DETAILS_FIELD_MASK,
-      'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetchFn(url.toString(), {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey,
+        'X-Goog-FieldMask': MINIMAL_PLACE_DETAILS_FIELD_MASK,
+        'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
+      },
+    });
+  } catch (err: any) {
+    throw new PlacesApiError(
+      err?.message || 'Error de red temporal consultando Place Details.',
+      503,
+      'PLACES_NETWORK_ERROR'
+    );
+  }
 
   if (!response.ok) {
-    if (response.status === 404) return null;
+    if (response.status === 404) {
+      return { status: 'unavailable' };
+    }
     const payload: any = await response.json().catch(() => ({}));
     const apiMsg = payload?.error?.message || `Error HTTP ${response.status} en Place Details`;
-    throw new PlacesApiError(apiMsg, response.status, payload?.error?.status || 'PLACE_DETAILS_ERROR');
+    const apiStatus = payload?.error?.status || '';
+
+    if (response.status === 400 && apiStatus === 'INVALID_ARGUMENT') {
+      return { status: 'unavailable' };
+    }
+
+    if (response.status === 429 || apiStatus === 'RESOURCE_EXHAUSTED') {
+      throw new PlacesApiError(
+        'Límite de cuota de Google Places API (New) alcanzado al recuperar detalles.',
+        429,
+        'PLACES_QUOTA_EXCEEDED'
+      );
+    }
+    if (response.status === 403 || apiStatus === 'PERMISSION_DENIED') {
+      throw new PlacesApiError(
+        `Places API (New) devolvió 403 (${apiMsg}).`,
+        403,
+        'PLACES_PERMISSION_DENIED'
+      );
+    }
+    throw new PlacesApiError(apiMsg, response.status, apiStatus || 'PLACE_DETAILS_ERROR');
   }
 
   const raw: any = await response.json().catch(() => null);
-  if (!raw || typeof raw.id !== 'string') return null;
+  if (!raw || typeof raw.id !== 'string') {
+    return { status: 'unavailable' };
+  }
 
   return {
-    placeId: raw.id.trim(),
-    displayName: raw.displayName?.text || 'Establecimiento sin nombre',
-    formattedAddress: raw.formattedAddress || 'Dirección no registrada',
-    nationalPhoneNumber: raw.nationalPhoneNumber || null,
-    internationalPhoneNumber: raw.internationalPhoneNumber || null,
-    websiteUri: raw.websiteUri || null,
-    googleMapsUri: raw.googleMapsUri || `https://www.google.com/maps/place/?q=place_id:${raw.id.trim()}`,
-    businessStatus: raw.businessStatus || null,
+    status: 'loaded',
+    details: {
+      placeId: raw.id.trim(),
+      displayName: raw.displayName?.text || 'Establecimiento sin nombre',
+      formattedAddress: raw.formattedAddress || 'Dirección no registrada',
+      nationalPhoneNumber: raw.nationalPhoneNumber || null,
+      internationalPhoneNumber: raw.internationalPhoneNumber || null,
+      websiteUri: raw.websiteUri || null,
+      googleMapsUri: raw.googleMapsUri || `https://www.google.com/maps/place/?q=place_id:${raw.id.trim()}`,
+      businessStatus: raw.businessStatus || null,
+    },
   };
+}
+
+export async function getPlaceDetailsById(
+  placeId: string,
+  opts?: { apiKey?: string; fetchFn?: typeof fetch }
+): Promise<import('../types').HydratedPlaceDetails | null> {
+  const outcome = await getPlaceDetailsByIdWithStatus(placeId, opts);
+  return outcome.status === 'loaded' ? outcome.details : null;
 }
 

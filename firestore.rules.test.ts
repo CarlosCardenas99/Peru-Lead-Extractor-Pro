@@ -36,5 +36,17 @@ describe('Firestore Security Rules (Eight Pillars & Dirty Dozen Static Audit)', 
     expect(rulesContent).toContain('requiresLegalBasis(');
     expect(rulesContent).toContain('data.legalBasis.size() >= 8');
     expect(rulesContent).toContain("data.sourceKind in ['places_preselection', 'independent_manual']");
+    expect(rulesContent).toContain('isValidOptionalIndependentFields(');
+    expect(rulesContent).toContain("'independentAddress'");
+    expect(rulesContent).toContain("'independentWebsite'");
+    expect(rulesContent).toContain("'independentCategory'");
+    expect(rulesContent).toContain("'independentPhoneType'");
+    expect(rulesContent).toContain("'independentTrustScore'");
+    expect(rulesContent).toContain("'completenessStatus'");
+    expect(rulesContent).toContain("'commercialOutcome'");
+    expect(rulesContent).toContain("'outcomeHistory'");
+    expect(rulesContent).toContain('data.verificationSources.size() <= 8');
+    expect(rulesContent).toContain('data.outcomeHistory.size() <= 10');
+    expect(rulesContent).toContain('/users/{userId}/sandbox_followups/{followupId}');
   });
 });

@@ -3,6 +3,8 @@ import {
   GeminiComplementaryAnalysis,
   GooglePlaceRaw,
   HydratedPlaceDetails,
+  IndependentCorroborationResult,
+  PlaceDetailsBatchItemResult,
   QuotaStatus,
   SearchParams,
   WebsiteProbeResult,
@@ -13,6 +15,7 @@ import { checkPlaceAgainstExclusions } from '../utils/exclusionUtils';
 import {
   computeContactabilityScore,
   computeDigitalOpportunityScore,
+  computeInformationTrustScore,
 } from '../utils/scoring';
 
 export interface PlacesPageResponse {
@@ -78,11 +81,11 @@ export async function searchPlacesPage(
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    if (
-      res.status === 429 &&
-      (data.code === 'PLACES_QUOTA_EXCEEDED' || data.code === 'RESOURCE_EXHAUSTED') &&
-      typeof window !== 'undefined'
-    ) {
+    const isGoogleQuota =
+      data.code === 'PLACES_QUOTA_EXCEEDED' ||
+      data.quotaSource === 'google_resource_exhausted' ||
+      (res.status === 429 && data.code === 'RESOURCE_EXHAUSTED');
+    if (isGoogleQuota && typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
     }
     throw new ApiClientError(
@@ -187,21 +190,143 @@ export async function analyzeLeadsComplementarily(
   return data;
 }
 
-export async function fetchPlaceDetailsBatch(placeIds: string[]): Promise<{
-  details: Record<string, HydratedPlaceDetails>;
-  quota?: QuotaStatus;
-}> {
-  if (placeIds.length === 0) return { details: {} };
-  const res = await fetch('/api/places/details', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ placeIds: placeIds.slice(0, 10) }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    return { details: {}, quota: data.quota };
+export async function corroborateLeadsIndependently(
+  items: Array<{
+    placeId: string;
+    officialWebsiteUrl?: string | null;
+    notesText?: string;
+    searchCategory?: string;
+    searchDistrict?: string;
+  }>
+): Promise<IndependentCorroborationResult[]> {
+  if (items.length === 0) return [];
+  const allResults: IndependentCorroborationResult[] = [];
+  for (let i = 0; i < items.length; i += 10) {
+    const chunk = items.slice(i, i + 10);
+    const res = await fetch('/api/corroborate-independent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: chunk }),
+    });
+    if (!res.ok) continue;
+    const data = await res.json().catch(() => ({}));
+    if (Array.isArray(data.results)) {
+      allResults.push(...data.results);
+    }
   }
-  return { details: data.details || {}, quota: data.quota };
+  return allResults;
+}
+
+export interface FetchPlaceDetailsBatchResponse {
+  details: Record<string, HydratedPlaceDetails>;
+  results: Record<string, PlaceDetailsBatchItemResult>;
+  quotaExceeded: boolean;
+  localQuotaReached: boolean;
+  quota?: QuotaStatus;
+  topLevelError?: string;
+}
+
+export async function fetchPlaceDetailsBatch(
+  placeIds: string[]
+): Promise<FetchPlaceDetailsBatchResponse> {
+  const uniqueIds = Array.from(
+    new Set(
+      placeIds
+        .map((id) => (id || '').trim())
+        .filter((id) => id && !id.startsWith('manual_'))
+    )
+  ).slice(0, 5);
+
+  if (uniqueIds.length === 0) {
+    return { details: {}, results: {}, quotaExceeded: false, localQuotaReached: false };
+  }
+
+  try {
+    const res = await fetch('/api/places/details', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ placeIds: uniqueIds }),
+    });
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      const isLocalQuota = data.code === 'LOCAL_DAILY_QUOTA_REACHED';
+      const isGoogleQuota =
+        !isLocalQuota &&
+        (res.status === 429 ||
+          data.code === 'PLACES_QUOTA_EXCEEDED' ||
+          data.quotaSource === 'google_resource_exhausted');
+      if (isGoogleQuota && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+      }
+      const fallbackResults: Record<string, PlaceDetailsBatchItemResult> = {};
+      for (const id of uniqueIds) {
+        fallbackResults[id] = {
+          status: isGoogleQuota
+            ? 'quota_exceeded'
+            : isLocalQuota
+            ? 'local_quota_exceeded'
+            : 'transient_error',
+          code: data.code || `HTTP_${res.status}`,
+          message: data.message || `Error HTTP ${res.status} al recuperar detalles.`,
+        };
+      }
+      return {
+        details: {},
+        results: fallbackResults,
+        quotaExceeded: isGoogleQuota,
+        localQuotaReached: isLocalQuota,
+        quota: data.quota,
+        topLevelError: data.message || `Error HTTP ${res.status}`,
+      };
+    }
+
+    const details: Record<string, HydratedPlaceDetails> = data.details || {};
+    const results: Record<string, PlaceDetailsBatchItemResult> = { ...(data.results || {}) };
+
+    // Backfill results if any caller provided details without explicit results entry
+    for (const id of uniqueIds) {
+      if (!results[id] && details[id]) {
+        results[id] = { status: 'loaded', details: details[id] };
+      }
+    }
+
+    const quotaExceeded =
+      Boolean(data.quotaExceeded) ||
+      Object.values(results).some((r) => r.status === 'quota_exceeded');
+    const localQuotaReached =
+      Boolean(data.localQuotaReached) ||
+      Object.values(results).some((r) => r.status === 'local_quota_exceeded');
+
+    if (quotaExceeded && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+    }
+
+    return {
+      details,
+      results,
+      quotaExceeded,
+      localQuotaReached,
+      quota: data.quota,
+    };
+  } catch (err: any) {
+    const fallbackResults: Record<string, PlaceDetailsBatchItemResult> = {};
+    const message = err?.message || 'Error de red temporal al recuperar detalles de Places.';
+    for (const id of uniqueIds) {
+      fallbackResults[id] = {
+        status: 'transient_error',
+        code: 'NETWORK_ERROR',
+        message,
+      };
+    }
+    return {
+      details: {},
+      results: fallbackResults,
+      quotaExceeded: false,
+      localQuotaReached: false,
+      topLevelError: message,
+    };
+  }
 }
 
 export function buildBusinessLeadFromPlace(
@@ -240,8 +365,14 @@ export function buildBusinessLeadFromPlace(
       };
 
   const emptyIndependentPhone = analyzePeruvianPhone('', 'none');
-  const digitalScore = computeDigitalOpportunityScore(initialWebsiteProbe, false);
+  const digitalScore = computeDigitalOpportunityScore(initialWebsiteProbe, false, { category });
   const contactabilityScore = computeContactabilityScore(phoneAnalysis, emptyIndependentPhone, '');
+  const trustScore = computeInformationTrustScore({
+    businessStatus: raw.businessStatus,
+    websiteProbe: initialWebsiteProbe,
+    confirmedNoWebsite: false,
+    verificationSourcesCount: 0,
+  });
   const exclusionMatch = checkPlaceAgainstExclusions(raw, exclusionKeys);
 
   return {
@@ -268,6 +399,7 @@ export function buildBusinessLeadFromPlace(
     independentWebsiteNote: '',
     digitalScore,
     contactabilityScore,
+    trustScore,
     exclusionMatch,
   };
 }

@@ -24,6 +24,7 @@ export function getNormalizedE164ForMatch(lead: BusinessLead): string | null {
 
 /**
  * Construye conjuntos de Place IDs ya registrados en CRM, clientes confirmados y duplicados en sesión.
+ * Respeta sucursales reales con Place ID distinto.
  */
 export function buildCrmAndDuplicateSets(
   leads: BusinessLead[],
@@ -41,7 +42,6 @@ export function buildCrmAndDuplicateSets(
     }
   }
 
-  // Deduplicación estricta por Place ID: detecta si hubiera repetidos y también teléfonos repetidos secundarios
   const seenPlaceIds = new Set<string>();
   const duplicatePlaceIds = new Set<string>();
 
@@ -61,7 +61,7 @@ export function buildCrmAndDuplicateSets(
 }
 
 /**
- * Evalúa si un establecimiento cumple con los filtros combinables del Explorador.
+ * Evalúa si un establecimiento cumple con los filtros combinables del Explorador (FASE 4).
  */
 export function matchesSmartFilters(
   lead: BusinessLead,
@@ -78,7 +78,13 @@ export function matchesSmartFilters(
   const isDiscardedInCrm = existingFollowup?.stage === 'DESCARTADO';
 
   if (filters.excludeClientsDiscardsDuplicates) {
-    if (isDiscarded || lead.exclusionMatch.excluded || isClient || isDiscardedInCrm) {
+    if (
+      isDiscarded ||
+      lead.exclusionMatch.excluded ||
+      isClient ||
+      isDiscardedInCrm ||
+      lead.businessStatus === 'CLOSED_PERMANENTLY'
+    ) {
       return false;
     }
   } else if (!ctx.showExcludedAndDiscarded && (isDiscarded || lead.exclusionMatch.excluded)) {
@@ -135,8 +141,9 @@ export function matchesSmartFilters(
 }
 
 /**
- * Clasifica determinísticamente un establecimiento para WEBNEX SYSTEMS.
- * Separa Oportunidad Digital de Contactabilidad. Nunca inventa probabilidad de compra ni WhatsApp.
+ * Clasifica determinísticamente un establecimiento para WEBNEX SYSTEMS (Smart Qualifier 2.0).
+ * Evalúa 3 dimensiones independientes (Necesidad Digital, Calidad del Contacto y Confianza de la Información).
+ * Nunca inventa probabilidad de compra (%) ni asume WhatsApp o actividad de línea sin corroboración.
  */
 export function evaluateLeadQualification(
   lead: BusinessLead,
@@ -145,7 +152,14 @@ export function evaluateLeadQualification(
 ): LeadQualificationResult {
   const geminiAnalysis = ctx.geminiAnalysesByPlaceId?.get(lead.placeId) || null;
   const reasons: string[] = [];
-  const missingInformation: string[] = [];
+  const missingInformation: string[] = [...(lead.trustScore?.missingCoreFields || [])];
+  const contradictions: string[] = [...(lead.trustScore?.contradictions || [])];
+
+  if (geminiAnalysis?.contradictions?.length) {
+    for (const c of geminiAnalysis.contradictions) {
+      if (!contradictions.includes(c)) contradictions.push(c);
+    }
+  }
 
   const lineType = lead.phoneAnalysis.lineType;
   const hasMobile = lineType === 'mobile' && lead.phoneAnalysis.isValidFormat;
@@ -158,11 +172,25 @@ export function evaluateLeadQualification(
   const existingFollowup = followupByPlaceId.get(lead.placeId);
   const alreadyInFollowup = Boolean(existingFollowup);
 
+  const digitalVal = lead.digitalScore.score;
+  const contactVal = lead.contactabilityScore.score;
+  const trustVal = lead.trustScore?.score ?? 25;
+  const isFichaCompleta = Boolean(
+    lead.independentPhone.trim() &&
+      (lead.independentWebsiteNote.trim() ||
+        lead.confirmedNoWebsite ||
+        lead.websiteProbe.provenance === 'independent_http')
+  );
+
   const reject = (excludedReason: string): LeadQualificationResult => ({
     placeId: lead.placeId,
     tier: 'NO ELEGIBLE',
-    digitalScore: lead.digitalScore.score,
-    contactabilityScore: lead.contactabilityScore.score,
+    digitalScore: digitalVal,
+    contactabilityScore: contactVal,
+    trustScore: trustVal,
+    combinedPriorityScore: 0,
+    isFichaCompleta: false,
+    contradictions,
     reasons: [excludedReason],
     missingInformation,
     isLandlineOnly,
@@ -177,7 +205,9 @@ export function evaluateLeadQualification(
   }
 
   if (lead.exclusionMatch.excluded) {
-    return reject(`Coincide con lista de exclusión (${lead.exclusionMatch.matchedRule || 'regla registrada'}).`);
+    return reject(
+      `Coincide con lista de exclusión (${lead.exclusionMatch.matchedRule || 'regla registrada'}).`
+    );
   }
 
   if (ctx.discardedPlaceIds.has(lead.placeId)) {
@@ -195,17 +225,19 @@ export function evaluateLeadQualification(
   }
 
   if (lead.businessStatus === 'CLOSED_PERMANENTLY') {
-    return reject('Google Places reporta cierre permanente del establecimiento.');
+    return reject('Google Places reporta cierre permanente del establecimiento (CLOSED_PERMANENTLY).');
   }
 
   if (isLandlineOnly) {
     return reject(
-      `Descartado por teléfono fijo (${lead.phoneAnalysis.note}); no registra celular peruano y nunca se convierte automáticamente en móvil.`
+      `Descartado de cola móvil por teléfono fijo (${lead.phoneAnalysis.note}); nunca se convierte automáticamente en celular.`
     );
   }
 
   if (!hasMobile) {
-    missingInformation.push('Sin celular peruano válido (9 dígitos iniciando en 9).');
+    if (!missingInformation.includes('Sin celular peruano válido (9 dígitos iniciando en 9).')) {
+      missingInformation.push('Sin celular peruano válido (9 dígitos iniciando en 9).');
+    }
     return reject(
       lead.phoneAnalysis.lineType === 'invalid'
         ? 'Número registrado con formato no estándar; sin celular peruano válido.'
@@ -213,39 +245,49 @@ export function evaluateLeadQualification(
     );
   }
 
-  // En este punto tiene celular peruano con formato válido (WhatsApp no asumido).
   const webStatus = lead.websiteProbe.status;
-  if (webStatus === 'active_https' && !lead.confirmedNoWebsite) {
-    reasons.push('Sitio web propio activo con HTTPS verificado (oportunidad digital baja).');
+  if (webStatus === 'active_https' && !lead.confirmedNoWebsite && digitalVal < 40) {
+    reasons.push('Sitio web propio activo con HTTPS verificado sin brechas críticas detectadas.');
     if (geminiAnalysis && geminiAnalysis.digitalNeeds.length > 0) {
       reasons.push(`Observación técnica web: ${geminiAnalysis.digitalNeeds[0]}`);
     }
     return {
       placeId: lead.placeId,
       tier: 'NO ELEGIBLE',
-      digitalScore: lead.digitalScore.score,
-      contactabilityScore: lead.contactabilityScore.score,
+      digitalScore: digitalVal,
+      contactabilityScore: contactVal,
+      trustScore: trustVal,
+      combinedPriorityScore: Math.round(digitalVal * 0.4 + contactVal * 0.35 + trustVal * 0.25),
+      isFichaCompleta,
+      contradictions,
       reasons,
       missingInformation,
       isLandlineOnly: false,
       hasMobile: true,
-      excludedReason: 'Sitio web HTTPS funcional ya operativo.',
+      excludedReason: 'Sitio web HTTPS funcional ya operativo sin brecha prioritaria.',
       alreadyInFollowup: false,
       geminiAnalysis,
     };
   }
 
-  // Evaluar información faltante explícitamente
+  // Información pendiente explícita (FASE 2 & 4)
   if (lead.phoneAnalysis.stage === 'registered_valid_format') {
-    missingInformation.push('Corroboración independiente de que el móvil esté activo y tenga autorización.');
+    missingInformation.push(
+      'Corroboración independiente de línea activa y autorización legal (WhatsApp no asumido).'
+    );
   }
   if (webStatus === 'unregistered' && !lead.confirmedNoWebsite) {
-    missingInformation.push('Confirmar manualmente que no posee dominio propio fuera de Google Maps.');
+    missingInformation.push(
+      'Confirmar manualmente si posee dominio propio ("sin web registrada" ≠ "sin web confirmada").'
+    );
   }
   if (webStatus === 'unverified_inconclusive') {
     missingInformation.push(
       `Revisión manual del sitio web (${lead.websiteProbe.inconclusiveReason || 'HTTP inconcluso'}).`
     );
+  }
+  if (lead.businessStatus === 'CLOSED_TEMPORARILY') {
+    missingInformation.push('Verificar si el establecimiento reabrió (reportado CLOSED_TEMPORARILY).');
   }
   if (geminiAnalysis?.missingInformation?.length) {
     for (const m of geminiAnalysis.missingInformation) {
@@ -253,19 +295,25 @@ export function evaluateLeadQualification(
     }
   }
 
-  // Clasificación entre PRIORIDAD ALTA y REVISIÓN PENDIENTE
   let tier: QualificationTier = 'REVISIÓN PENDIENTE';
 
-  if (
+  const hasVerifiedDigitalGap =
     lead.confirmedNoWebsite ||
     webStatus === 'confirmed_none' ||
     webStatus === 'unreachable_verified' ||
     webStatus === 'social_only' ||
-    webStatus === 'invalid_url'
+    webStatus === 'invalid_url';
+
+  if (
+    hasVerifiedDigitalGap &&
+    lead.businessStatus !== 'CLOSED_TEMPORARILY' &&
+    contradictions.length === 0
   ) {
     tier = 'PRIORIDAD ALTA';
     if (lead.confirmedNoWebsite || webStatus === 'confirmed_none') {
-      reasons.push('Ausencia de sitio web propio confirmada manualmente (alta oportunidad para diseño web WEBNEX).');
+      reasons.push(
+        'Ausencia de sitio web propio confirmada manualmente (alta necesidad digital WEBNEX).'
+      );
     } else if (webStatus === 'unreachable_verified') {
       reasons.push('Sitio web registrado presenta fallo definitivo verificado (DNS/HTTP inaccesible).');
     } else if (webStatus === 'social_only') {
@@ -273,33 +321,50 @@ export function evaluateLeadQualification(
     } else if (webStatus === 'invalid_url') {
       reasons.push('URL registrada en ficha tiene formato inválido o inutilizable.');
     }
-    reasons.push('Cuenta con celular peruano de formato válido (WhatsApp no asumido; contacto sujeto a base legal/consentimiento).');
+    reasons.push(
+      'Celular peruano con formato válido (WhatsApp y vigencia sujetos a corroboración y base legal).'
+    );
   } else {
-    // unregistered, unverified_inconclusive, active_http -> REVISIÓN PENDIENTE
     tier = 'REVISIÓN PENDIENTE';
-    if (webStatus === 'unregistered') {
-      reasons.push('Sin web registrada en Google Maps (distinto de ausencia comprobada; requiere verificación rápida).');
+    if (lead.businessStatus === 'CLOSED_TEMPORARILY') {
+      reasons.push('Figura temporalmente cerrado (CLOSED_TEMPORARILY): requiere confirmación operativa.');
+    } else if (contradictions.length > 0) {
+      reasons.push(`Señales contradictorias detectadas: ${contradictions[0]}`);
+    } else if (webStatus === 'unregistered') {
+      reasons.push(
+        'Sin web registrada en Maps (distinto de ausencia confirmada; requiere verificación independiente).'
+      );
     } else if (webStatus === 'unverified_inconclusive') {
       reasons.push(
         lead.websiteProbe.provenance === 'google_absent'
-          ? 'URL registrada en Maps aún no verificada por HTTP independiente.'
+          ? 'URL registrada aún no verificada por HTTP independiente.'
           : `Verificación web inconclusa (${lead.websiteProbe.inconclusiveReason || 'antibots/403/429'}); requiere revisión manual.`
       );
-    } else if (webStatus === 'active_http') {
-      reasons.push('Sitio web responde sin HTTPS; candidato a evaluación de modernización y certificado SSL.');
+    } else if (webStatus === 'active_http' || webStatus === 'active_https') {
+      reasons.push(
+        'Sitio web con hallazgos técnicos (ej. sin HTTPS o sin metadatos completos) candidato a modernización.'
+      );
     }
     reasons.push('Celular peruano con formato válido disponible para validación previa.');
   }
 
   if (geminiAnalysis?.commercialRelevance) {
-    reasons.push(`Análisis técnico web (Gemini): ${geminiAnalysis.commercialRelevance}`);
+    reasons.push(`Analista Gemini (datos propios): ${geminiAnalysis.commercialRelevance}`);
   }
+
+  const combinedPriorityScore = Math.round(
+    digitalVal * 0.45 + contactVal * 0.3 + trustVal * 0.25
+  );
 
   return {
     placeId: lead.placeId,
     tier,
-    digitalScore: lead.digitalScore.score,
-    contactabilityScore: lead.contactabilityScore.score,
+    digitalScore: digitalVal,
+    contactabilityScore: contactVal,
+    trustScore: trustVal,
+    combinedPriorityScore,
+    isFichaCompleta,
+    contradictions,
     reasons,
     missingInformation,
     isLandlineOnly: false,
