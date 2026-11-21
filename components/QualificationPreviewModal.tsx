@@ -1,8 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   CheckCircle2,
+  ExternalLink,
   Globe,
   Info,
+  ListPlus,
+  Search,
   ShieldCheck,
   Sparkles,
   X,
@@ -10,19 +14,23 @@ import {
 import {
   BusinessLead,
   CrmWorkspaceMode,
+  FieldResearchClassification,
   IndependentCorroborationResult,
   IndependentFieldSource,
   LeadQualificationResult,
+  MissingDataResearchResult,
   PhoneLineType,
   QualifierBatchSummary,
+  ResearchableFieldKey,
 } from '../types';
-import { corroborateLeadsIndependently } from '../services/geminiService';
+import { researchMissingLeadDataBatch } from '../services/geminiService';
 import { analyzePeruvianPhone } from '../utils/peruPhone';
 import {
   encodeVerificationProvenanceEntry,
   evaluateFollowupCompleteness,
   FIELD_STORAGE_COMPLIANCE_MATRIX,
   formatIndependentSourceLabel,
+  getFieldClassificationMeta,
   mergeVerificationSources,
   parseVerificationProvenanceEntry,
   resolveIndependentPhoneType,
@@ -40,6 +48,7 @@ export interface PreparedTransferDraft {
   independentEmail: string;
   independentCategory: string;
   confirmedNoWebsite: boolean;
+  hasResearchContradictions?: boolean;
   verificationSummary: string;
   lastVerifiedAt: string;
   verificationSources: string[];
@@ -65,6 +74,7 @@ interface QualificationPreviewModalProps {
   isSaving: boolean;
   workspaceMode?: CrmWorkspaceMode;
   onChangeWorkspaceMode?: (mode: CrmWorkspaceMode) => void;
+  onAddSelectedToTemporaryQueue?: (placeIds: string[]) => void;
   onClose: () => void;
   onConfirmTransfer: (selectedItems: PreparedTransferItem[]) => Promise<void>;
 }
@@ -224,6 +234,17 @@ function applyCorroborationToDraft(
   return next;
 }
 
+function applyResearchResultToDraft(
+  prev: PreparedTransferDraft,
+  research: MissingDataResearchResult
+): PreparedTransferDraft {
+  const updated = applyCorroborationToDraft(prev, research.corroboration);
+  return {
+    ...updated,
+    hasResearchContradictions: research.hasContradictions,
+  };
+}
+
 export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps> = ({
   isOpen,
   isAnalyzing,
@@ -238,6 +259,7 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
   isSaving,
   workspaceMode = 'production',
   onChangeWorkspaceMode,
+  onAddSelectedToTemporaryQueue,
   onClose,
   onConfirmTransfer,
 }) => {
@@ -245,6 +267,10 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
   const [viewMode, setViewMode] = useState<'eligible' | 'rejected'>('eligible');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [draftsByPlaceId, setDraftsByPlaceId] = useState<Record<string, PreparedTransferDraft>>({});
+  const [researchByPlaceId, setResearchByPlaceId] = useState<Record<string, MissingDataResearchResult>>({});
+  const [socialUrlsByPlaceId, setSocialUrlsByPlaceId] = useState<Record<string, string>>({});
+  const [evidenceTextByPlaceId, setEvidenceTextByPlaceId] = useState<Record<string, string>>({});
+  const [researchingPlaceId, setResearchingPlaceId] = useState<string | null>(null);
   const [manualCaptureSource, setManualCaptureSource] =
     useState<IndependentFieldSource>('user_manual_entry');
   const [provenanceConfirmed, setProvenanceConfirmed] = useState(false);
@@ -284,6 +310,10 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
       setSelectedIds(new Set(eligibleResults.map((r) => r.placeId)));
       setViewMode(eligibleResults.length > 0 ? 'eligible' : 'rejected');
       setCorroborationNotice(null);
+      setResearchByPlaceId({});
+      setSocialUrlsByPlaceId({});
+      setEvidenceTextByPlaceId({});
+      setResearchingPlaceId(null);
       setManualCaptureSource('user_manual_entry');
       setProvenanceConfirmed(false);
     } else if (eligibleResults.length > 0) {
@@ -360,10 +390,10 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
     });
   };
 
-  const handleCorroborateFromWebsites = async () => {
-    const targetIds = eligibleResults
-      .filter((r) => selectedIds.has(r.placeId))
-      .map((r) => r.placeId);
+  const handleResearchMissingData = async (singlePlaceId?: string) => {
+    const targetIds = singlePlaceId
+      ? [singlePlaceId]
+      : eligibleResults.filter((r) => selectedIds.has(r.placeId)).map((r) => r.placeId);
     if (targetIds.length === 0) return;
 
     const payloadItems = targetIds
@@ -371,27 +401,51 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
         const lead = leadMap.get(placeId);
         const draft = draftsByPlaceId[placeId];
         if (!lead) return null;
+        const userEvidence = (evidenceTextByPlaceId[placeId] || '').trim();
         return {
           placeId,
           officialWebsiteUrl: draft?.independentWebsite || lead.website || null,
+          socialOrDirectoryUrl: (socialUrlsByPlaceId[placeId] || '').trim() || null,
+          userProvidedEvidenceText: userEvidence,
           notesText: draft?.notes || lead.independentWebsiteNote || '',
           searchCategory: draft?.independentCategory || searchCategory || lead.category,
           searchDistrict: draft?.district || searchDistrict,
+          allowGeminiEvidenceAnalysis: userEvidence.length >= 15,
+          sessionMapsRef: {
+            name: lead.name,
+            address: lead.address,
+            phone: lead.phone !== 'Sin teléfono' ? lead.phone : '',
+            website: lead.website || '',
+            district: searchDistrict.replace(/,?\s*per[uú]$/i, '').trim(),
+          },
         };
       })
       .filter((item): item is NonNullable<typeof item> => Boolean(item));
 
-    setIsCorroborating(true);
+    if (singlePlaceId) setResearchingPlaceId(singlePlaceId);
+    else setIsCorroborating(true);
     setCorroborationNotice(null);
     try {
-      const resultsList = await corroborateLeadsIndependently(payloadItems);
+      const response = await researchMissingLeadDataBatch(payloadItems);
+      const resultsList = response.results || [];
       let enrichedCount = 0;
+      let completeReadyCount = 0;
+      let contradictionsCount = 0;
+
+      setResearchByPlaceId((prev) => {
+        const next = { ...prev };
+        for (const r of resultsList) next[r.placeId] = r;
+        return next;
+      });
+
       setDraftsByPlaceId((prev) => {
         const next = { ...prev };
-        for (const corr of resultsList) {
-          const existing = next[corr.placeId];
+        for (const research of resultsList) {
+          if (research.canPersistCompleteCard) completeReadyCount += 1;
+          if (research.hasContradictions) contradictionsCount += 1;
+          const existing = next[research.placeId];
           if (!existing) continue;
-          const updated = applyCorroborationToDraft(existing, corr);
+          const updated = applyResearchResultToDraft(existing, research);
           if (
             updated.independentBusinessName !== existing.independentBusinessName ||
             updated.independentPhone !== existing.independentPhone ||
@@ -401,15 +455,16 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
           ) {
             enrichedCount += 1;
           }
-          next[corr.placeId] = updated;
+          next[research.placeId] = updated;
         }
         return next;
       });
       setCorroborationNotice(
-        `Corroboración independiente completada sobre ${resultsList.length} prospectos (0 consultas a Google Places). ${enrichedCount} fichas obtuvieron nuevos campos desde sitio web oficial.`
+        `Investigación independiente completada sobre ${resultsList.length} prospecto(s) (0 consultas a Google Places). ${enrichedCount} ficha(s) recibieron nuevos campos persistibles · ${completeReadyCount} listas completas · ${contradictionsCount} con alertas/contradicciones.`
       );
     } finally {
-      setIsCorroborating(false);
+      if (singlePlaceId) setResearchingPlaceId(null);
+      else setIsCorroborating(false);
     }
   };
 
@@ -585,47 +640,65 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
                 </div>
               )}
 
-              {/* Toolbar de Corroboración Web Oficial & Matriz de Permisos */}
-              {viewMode === 'eligible' && eligibleResults.length > 0 && (
-                <div className="bg-purple-50/60 border border-purple-200 rounded-xl p-4 space-y-3">
-                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-                    <div className="text-xs text-purple-950">
-                      <div className="font-semibold flex items-center gap-1.5">
-                        <ShieldCheck className="w-4 h-4 text-purple-700 shrink-0" />
-                        Preparar ficha comercial persistente (ToS-compliant · 0 Places)
-                      </div>
-                      <p className="text-purple-900/80 mt-0.5">
-                        Los datos mostrados a la izquierda son de sesión de Explorador. Usa corroboración desde el sitio web oficial del negocio o captura manual para guardar nombre, teléfono, dirección, web y categoría de forma permanente en Firebase.
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => setShowComplianceMatrix((v) => !v)}
-                        className="px-3 py-1.5 text-xs font-medium border border-purple-300 bg-white text-purple-800 rounded-lg hover:bg-purple-50 inline-flex items-center gap-1"
-                      >
-                        <Info className="w-3.5 h-3.5" />
-                        {showComplianceMatrix ? 'Ocultar matriz ToS' : 'Ver matriz de permisos'}
-                      </button>
-                      <button
-                        type="button"
-                        disabled={isCorroborating || selectedItems.length === 0}
-                        onClick={handleCorroborateFromWebsites}
-                        className="px-3.5 py-1.5 text-xs font-semibold bg-purple-700 text-white rounded-lg hover:bg-purple-800 disabled:opacity-50 inline-flex items-center gap-1.5"
-                      >
-                        <Globe className="w-3.5 h-3.5" />
-                        {isCorroborating
-                          ? 'Corroborando webs...'
-                          : 'Corroborar desde Web Oficial (0 Places)'}
-                      </button>
-                    </div>
-                  </div>
+              {/* Toolbar de Investigación de Datos Faltantes (0 Places) & Matriz de Permisos */}
+              {viewMode === 'eligible' && eligibleResults.length > 0 && (() => {
+                const needingDataCount = selectedItems.filter(
+                  ({ draft }) =>
+                    evaluateFollowupCompleteness({
+                      ...draft,
+                      confirmedNoWebsite: draft.confirmedNoWebsite,
+                    }).isFichaIncompleta
+                ).length;
 
-                  {corroborationNotice && (
-                    <div className="text-xs bg-white border border-purple-200 text-purple-900 rounded-lg px-3 py-2">
-                      {corroborationNotice}
+                return (
+                  <div className="bg-purple-50/60 border border-purple-200 rounded-xl p-4 space-y-3">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                      <div className="text-xs text-purple-950">
+                        <div className="font-semibold flex items-center gap-1.5">
+                          <ShieldCheck className="w-4 h-4 text-purple-700 shrink-0" />
+                          Investigar datos faltantes (0 Places) · Corroboración para Firestore
+                        </div>
+                        <p className="text-purple-900/80 mt-0.5">
+                          <strong>{needingDataCount}</strong> de <strong>{selectedItems.length}</strong> candidato(s) preseleccionado(s) requieren datos comerciales independientes persistibles. Consulta web oficial, Meta oEmbed/estado de acceso, padrón empresarial abierto (DatosPeru/SUNAT) y evidencia provista sin copiar campos de Google Maps.
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setShowComplianceMatrix((v) => !v)}
+                          className="px-3 py-1.5 text-xs font-medium border border-purple-300 bg-white text-purple-800 rounded-lg hover:bg-purple-50 inline-flex items-center gap-1"
+                        >
+                          <Info className="w-3.5 h-3.5" />
+                          {showComplianceMatrix ? 'Ocultar matriz ToS' : 'Ver matriz de permisos'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isCorroborating || selectedItems.length === 0}
+                          onClick={() => handleResearchMissingData()}
+                          className="px-3.5 py-1.5 text-xs font-semibold bg-purple-700 text-white rounded-lg hover:bg-purple-800 disabled:opacity-50 inline-flex items-center gap-1.5"
+                        >
+                          <Search className="w-3.5 h-3.5" />
+                          {isCorroborating
+                            ? 'Investigando fuentes (0 Places)...'
+                            : 'Investigar datos faltantes (0 Places)'}
+                        </button>
+                      </div>
                     </div>
-                  )}
+
+                    <div className="text-[11px] text-slate-700 bg-white/80 border border-purple-100 rounded-lg px-3 py-2 space-y-1">
+                      <div>
+                        Embudo obligatorio: <strong>1. Candidato Maps</strong> → <strong>2. Ficha comercial corroborada</strong> → <strong>3. Contacto legalmente autorizado</strong> → <strong>4. Contacto alcanzado</strong>.
+                      </div>
+                      <div className="text-slate-600">
+                        Separación estricta de conceptos: <strong>(1) Formato telefónico válido</strong> ≠ <strong>(2) Teléfono corroborado</strong> ≠ <strong>(3) Autorización de contacto</strong> ≠ <strong>(4) Resultado real</strong>. Un celular válido no demuestra WhatsApp ni permiso de llamada.
+                      </div>
+                    </div>
+
+                    {corroborationNotice && (
+                      <div className="text-xs bg-white border border-purple-200 text-purple-900 rounded-lg px-3 py-2">
+                        {corroborationNotice}
+                      </div>
+                    )}
 
                   {showComplianceMatrix && (
                     <div className="bg-white border border-purple-200 rounded-lg overflow-x-auto">
@@ -656,7 +729,8 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
                     </div>
                   )}
                 </div>
-              )}
+                );
+              })()}
 
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
                 <div className="flex gap-2">
@@ -1024,6 +1098,193 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
                                 </div>
                               )}
                             </div>
+
+                            {/* Entradas de investigación independiente por candidato + Clasificación de 4 estados */}
+                            <div className="pt-2.5 border-t border-slate-200 space-y-2.5">
+                              <div className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end">
+                                <div className="md:col-span-5">
+                                  <label className="block text-[11px] font-medium text-slate-600 mb-0.5">
+                                    URL de Facebook / Instagram / DatosPeru (opcional)
+                                  </label>
+                                  <input
+                                    type="url"
+                                    value={socialUrlsByPlaceId[res.placeId] || ''}
+                                    onChange={(e) =>
+                                      setSocialUrlsByPlaceId((prev) => ({
+                                        ...prev,
+                                        [res.placeId]: e.target.value,
+                                      }))
+                                    }
+                                    placeholder="https://facebook.com/... o datosperu.org/empresa-..."
+                                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded-md text-xs"
+                                  />
+                                </div>
+                                <div className="md:col-span-5">
+                                  <label className="block text-[11px] font-medium text-slate-600 mb-0.5">
+                                    Evidencia comercial provista por usuario (bio / tarjeta / nota)
+                                  </label>
+                                  <input
+                                    type="text"
+                                    value={evidenceTextByPlaceId[res.placeId] || ''}
+                                    onChange={(e) =>
+                                      setEvidenceTextByPlaceId((prev) => ({
+                                        ...prev,
+                                        [res.placeId]: e.target.value,
+                                      }))
+                                    }
+                                    placeholder="Pega datos visibles propios para extracción literal (0 invención)"
+                                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded-md text-xs"
+                                  />
+                                </div>
+                                <div className="md:col-span-2">
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      researchingPlaceId === res.placeId || isCorroborating
+                                    }
+                                    onClick={() => handleResearchMissingData(res.placeId)}
+                                    className="w-full px-2.5 py-1.5 text-xs font-semibold border border-purple-300 bg-purple-50 text-purple-900 rounded-md hover:bg-purple-100 disabled:opacity-50 inline-flex items-center justify-center gap-1"
+                                  >
+                                    <Globe className="w-3.5 h-3.5" />
+                                    {researchingPlaceId === res.placeId
+                                      ? 'Buscando...'
+                                      : 'Investigar (0 Places)'}
+                                  </button>
+                                </div>
+                              </div>
+
+                              {researchByPlaceId[res.placeId] && (() => {
+                                const research = researchByPlaceId[res.placeId];
+                                const fieldKeys: ResearchableFieldKey[] = [
+                                  'businessName',
+                                  'phone',
+                                  'address',
+                                  'district',
+                                  'website',
+                                  'email',
+                                  'category',
+                                ];
+                                return (
+                                  <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-2.5 text-[11px]">
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                      <span className="font-semibold text-slate-800">
+                                        Resultado investigación (0 Places): {research.identityMatch.summary}
+                                      </span>
+                                      <span
+                                        className={`px-2 py-0.5 border rounded font-semibold ${
+                                          research.hasContradictions
+                                            ? 'bg-rose-50 text-rose-900 border-rose-300'
+                                            : research.canPersistCompleteCard
+                                            ? 'bg-emerald-50 text-emerald-900 border-emerald-300'
+                                            : 'bg-amber-50 text-amber-900 border-amber-300'
+                                        }`}
+                                      >
+                                        {research.hasContradictions
+                                          ? 'Contradicción -> PENDIENTE DE VERIFICACIÓN'
+                                          : research.canPersistCompleteCard
+                                          ? 'Completa persistible'
+                                          : research.identityMatch.identityStatusLabel === 'IDENTIDAD NO CONFIRMADA'
+                                          ? 'IDENTIDAD NO CONFIRMADA -> PENDIENTE DE VERIFICACIÓN'
+                                          : 'Cola investigación -> PENDIENTE DE VERIFICACIÓN'}
+                                      </span>
+                                    </div>
+
+                                    {research.contradictionAlerts.length > 0 && (
+                                      <div className="bg-rose-50 border border-rose-300 text-rose-900 rounded px-2.5 py-2 space-y-0.5">
+                                        <div className="font-semibold flex items-center gap-1">
+                                          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                                          Contradicción detectada (no auto-completado)
+                                        </div>
+                                        {research.contradictionAlerts.map((alert, i) => (
+                                          <div key={i}>• {alert}</div>
+                                        ))}
+                                      </div>
+                                    )}
+
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-1.5">
+                                      {fieldKeys.map((fk) => {
+                                        const fc: FieldResearchClassification =
+                                          research.fieldClassifications[fk];
+                                        const meta = getFieldClassificationMeta(fc.status);
+                                        return (
+                                          <div
+                                            key={fk}
+                                            className="bg-white border border-slate-200 rounded p-2 space-y-0.5"
+                                            title={fc.reason}
+                                          >
+                                            <div className="flex items-center justify-between gap-1">
+                                              <span className="font-semibold text-slate-700">
+                                                {fc.label}
+                                              </span>
+                                              <span
+                                                className={`px-1.5 py-0.5 text-[10px] border rounded ${meta.badgeClass}`}
+                                              >
+                                                {meta.shortLabel}
+                                              </span>
+                                            </div>
+                                            <div className="text-slate-900 truncate">
+                                              {fc.independentValue ||
+                                                fc.mapsSessionValue ||
+                                                'Sin registro'}
+                                            </div>
+                                            <div className="text-[10px] text-slate-500 truncate">
+                                              {fc.sourceLabel}
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+
+                                    <div className="space-y-1">
+                                      <div className="font-semibold text-slate-700">
+                                        Fuentes consultadas honestamente:
+                                      </div>
+                                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                                        {research.sourceAttempts.map((att, idx) => (
+                                          <div
+                                            key={idx}
+                                            className="bg-white border border-slate-200 rounded px-2 py-1.5"
+                                          >
+                                            <div className="font-medium text-slate-800">
+                                              {att.sourceName} ·{' '}
+                                              <span className="font-mono-tabular">
+                                                {att.status}
+                                                {att.httpStatus ? ` (HTTP ${att.httpStatus})` : ''}
+                                              </span>
+                                            </div>
+                                            <div className="text-[10px] text-slate-600">
+                                              {att.detail} ({att.costNote})
+                                            </div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+
+                                    {research.manualReviewLinks.length > 0 &&
+                                      research.recommendedQueue === 'research_queue' && (
+                                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                                          <span className="font-semibold text-slate-700">
+                                            Revisión manual sin scraping:
+                                          </span>
+                                          {research.manualReviewLinks.map((lnk, i) => (
+                                            <a
+                                              key={i}
+                                              href={lnk.url}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="inline-flex items-center gap-1 text-purple-700 hover:underline font-medium"
+                                              title={lnk.note}
+                                            >
+                                              {lnk.label}
+                                              <ExternalLink className="w-3 h-3" />
+                                            </a>
+                                          ))}
+                                        </div>
+                                      )}
+                                  </div>
+                                );
+                              })()}
+                            </div>
                           </div>
                         )}
 
@@ -1133,7 +1394,7 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
                 : 'Inicia sesión con Google para confirmar y guardar preseleccionados en Firebase.'}
             </div>
           </div>
-          <div className="flex items-center gap-2 justify-end shrink-0">
+          <div className="flex flex-wrap items-center gap-2 justify-end shrink-0">
             <button
               type="button"
               onClick={onClose}
@@ -1141,6 +1402,20 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
             >
               Cerrar
             </button>
+            {onAddSelectedToTemporaryQueue && (
+              <button
+                type="button"
+                disabled={isAnalyzing || selectedItems.length === 0}
+                onClick={() => {
+                  onAddSelectedToTemporaryQueue(selectedItems.map((i) => i.result.placeId));
+                  onClose();
+                }}
+                className="px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-40 text-white rounded-lg inline-flex items-center gap-1.5"
+              >
+                <ListPlus className="w-4 h-4" />
+                Agregar ({selectedItems.length}) a Seguimiento Temporal (0 Places)
+              </button>
+            )}
             <button
               type="button"
               disabled={!isSignedIn || isAnalyzing || isSaving || selectedItems.length === 0}
@@ -1151,8 +1426,8 @@ export const QualificationPreviewModal: React.FC<QualificationPreviewModalProps>
               {isSaving
                 ? 'Guardando en CRM...'
                 : workspaceMode === 'sandbox'
-                ? `Enviar (${selectedItems.length}) a Sandbox`
-                : `Confirmar y enviar (${selectedItems.length}) a Seguimiento`}
+                ? `Enviar (${selectedItems.length}) a Sandbox Firestore`
+                : `Confirmar y enviar (${selectedItems.length}) a CRM Firestore`}
             </button>
           </div>
         </div>

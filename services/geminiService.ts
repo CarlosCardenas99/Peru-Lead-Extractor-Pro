@@ -4,6 +4,8 @@ import {
   GooglePlaceRaw,
   HydratedPlaceDetails,
   IndependentCorroborationResult,
+  MissingDataResearchItemInput,
+  MissingDataResearchResult,
   PlaceDetailsBatchItemResult,
   QuotaStatus,
   SearchParams,
@@ -215,6 +217,43 @@ export async function corroborateLeadsIndependently(
     }
   }
   return allResults;
+}
+
+export interface ResearchMissingLeadDataResponse {
+  results: MissingDataResearchResult[];
+  placesCallsConsumed: number;
+  quota?: QuotaStatus;
+}
+
+export async function researchMissingLeadDataBatch(
+  items: MissingDataResearchItemInput[]
+): Promise<ResearchMissingLeadDataResponse> {
+  if (items.length === 0) {
+    return { results: [], placesCallsConsumed: 0 };
+  }
+  const allResults: MissingDataResearchResult[] = [];
+  let latestQuota: QuotaStatus | undefined;
+
+  for (let i = 0; i < items.length; i += 10) {
+    const chunk = items.slice(i, i + 10);
+    const res = await fetch('/api/leads/research-missing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: chunk }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data?.quota) latestQuota = data.quota;
+    if (!res.ok) continue;
+    if (Array.isArray(data.results)) {
+      allResults.push(...data.results);
+    }
+  }
+
+  return {
+    results: allResults,
+    placesCallsConsumed: 0,
+    quota: latestQuota,
+  };
 }
 
 export interface FetchPlaceDetailsBatchResponse {

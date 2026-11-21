@@ -1,6 +1,8 @@
 import {
+  AUTHORIZED_OUTREACH_STAGES,
   COMMERCIAL_OUTCOME_OPTIONS,
   CommercialOutcomeType,
+  FieldClassificationStatus,
   FollowupCompletenessInfo,
   FollowupLeadRecord,
   GooglePlacesStoragePolicy,
@@ -83,6 +85,7 @@ const ALLOWED_INDEPENDENT_SOURCES: ReadonlySet<IndependentFieldSource> = new Set
   'official_website_jsonld',
   'official_website_html',
   'authorized_public_source',
+  'meta_graph_api',
   'user_manual_entry',
   'phone_call_verified',
   'user_search_context',
@@ -97,7 +100,9 @@ export function formatIndependentSourceLabel(source: IndependentFieldSource | st
     case 'official_website_html':
       return 'Web oficial (HTML / contacto público)';
     case 'authorized_public_source':
-      return 'Fuente empresarial autorizada';
+      return 'Directorio / fuente empresarial autorizada';
+    case 'meta_graph_api':
+      return 'Meta Graph API / oEmbed autorizado';
     case 'user_manual_entry':
       return 'Captura legítima del usuario';
     case 'phone_call_verified':
@@ -487,4 +492,100 @@ export function isIndependentEntryDistinctFromRawMapsGuard(params: {
   source: IndependentFieldSource;
 }): boolean {
   return params.source !== 'none' && ALLOWED_INDEPENDENT_SOURCES.has(params.source);
+}
+
+export function getFieldClassificationMeta(status: FieldClassificationStatus): {
+  label: string;
+  shortLabel: string;
+  badgeClass: string;
+} {
+  switch (status) {
+    case 'corroborated_persistable':
+      return {
+        label: 'Corroborado independientemente y persistible',
+        shortLabel: 'Corroborado persistible',
+        badgeClass: 'bg-emerald-50 text-emerald-900 border-emerald-300',
+      };
+    case 'maps_session_only':
+      return {
+        label: 'Disponible solamente en sesión de Google Maps',
+        shortLabel: 'Solo sesión Maps',
+        badgeClass: 'bg-sky-50 text-sky-900 border-sky-300',
+      };
+    case 'contradictory':
+      return {
+        label: 'Contradictorio',
+        shortLabel: 'Contradictorio',
+        badgeClass: 'bg-rose-50 text-rose-900 border-rose-300',
+      };
+    case 'not_found':
+    default:
+      return {
+        label: 'No encontrado',
+        shortLabel: 'No encontrado',
+        badgeClass: 'bg-slate-100 text-slate-700 border-slate-300',
+      };
+  }
+}
+
+export interface FourStagePipelineStatus {
+  mapsCandidate: boolean;
+  corroboratedCard: boolean;
+  legallyAuthorized: boolean;
+  contactReached: boolean;
+  currentStageLabel:
+    | '1. Candidato en Google Maps'
+    | '2. Ficha comercial corroborada'
+    | '3. Contacto legalmente autorizado'
+    | '4. Contacto alcanzado';
+}
+
+export function evaluateFourStagePipelineStatus(
+  record: Pick<
+    FollowupLeadRecord,
+    | 'placeId'
+    | 'independentBusinessName'
+    | 'independentPhone'
+    | 'independentAddress'
+    | 'district'
+    | 'independentWebsite'
+    | 'confirmedNoWebsite'
+    | 'independentEmail'
+    | 'independentCategory'
+    | 'stage'
+    | 'legalBasis'
+    | 'phoneStage'
+    | 'commercialOutcome'
+  >
+): FourStagePipelineStatus {
+  const completeness = evaluateFollowupCompleteness(record);
+  const mapsCandidate = Boolean(record.placeId && !record.placeId.startsWith('manual_'));
+  const corroboratedCard = completeness.status === 'complete';
+  const legallyAuthorized =
+    AUTHORIZED_OUTREACH_STAGES.has(record.stage) && (record.legalBasis || '').trim().length >= 8;
+  const reachedStages = new Set(['CONTACTADO', 'RESPONDIÓ', 'INTERESADO', 'COTIZACIÓN', 'CLIENTE']);
+  const contactReached =
+    reachedStages.has(record.stage) ||
+    record.phoneStage === 'contact_reached' ||
+    Boolean(
+      record.commercialOutcome &&
+        record.commercialOutcome !== 'none' &&
+        record.commercialOutcome !== 'datos_incorrectos'
+    );
+
+  const currentStageLabel = contactReached
+    ? '4. Contacto alcanzado'
+    : legallyAuthorized
+    ? '3. Contacto legalmente autorizado'
+    : corroboratedCard
+    ? '2. Ficha comercial corroborada'
+    : '1. Candidato en Google Maps';
+
+  return {
+    mapsCandidate,
+    corroboratedCard,
+    legallyAuthorized,
+    contactReached,
+    currentStageLabel,
+  };
 }

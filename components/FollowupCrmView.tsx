@@ -6,8 +6,10 @@ import {
   ExternalLink,
   Eye,
   Globe,
+  Search,
   ShieldCheck,
   Sparkles,
+  Trash2,
   X,
 } from 'lucide-react';
 import {
@@ -20,17 +22,26 @@ import {
   FollowupLeadRecord,
   FollowupStage,
   IndependentFieldSource,
+  MissingDataResearchResult,
   PhoneVerificationStage,
   PlaceHydrationEntry,
   PlacesQuotaBlockState,
   QuotaStatus,
+  ResearchableFieldKey,
+  TemporaryQueueEntry,
+  TemporaryQueueIndependentDraft,
+  TemporaryQueueOutcome,
+  TemporaryQueuePriority,
+  TemporaryQueueTtlHours,
 } from '../types';
 import {
+  BatchDeleteFollowupsResult,
+  BatchDeleteProgress,
   buildSafeLegacyCleanupPreview,
   MissingFieldRecoveryProposal,
   UpdateFollowupOutcome,
 } from '../services/firebaseService';
-import { corroborateLeadsIndependently } from '../services/geminiService';
+import { researchMissingLeadDataBatch } from '../services/geminiService';
 import {
   formatPhoneLineTypeLabel,
   getHydrationStatusMeta,
@@ -43,8 +54,10 @@ import {
   buildPersistedVerificationReport,
   encodeVerificationProvenanceEntry,
   evaluateFollowupCompleteness,
+  evaluateFourStagePipelineStatus,
   formatIndependentSourceLabel,
   getCommercialOutcomeLabel,
+  getFieldClassificationMeta,
   mergeVerificationSources,
   parseOutcomeHistoryEntry,
   parseVerificationProvenanceEntry,
@@ -55,6 +68,7 @@ import { computeOutcomeCalibrationStats } from '../utils/scoring';
 import { ExportButton } from './ExportButton';
 import { FollowupRecoveryModal } from './FollowupRecoveryModal';
 import { Pagination } from './Pagination';
+import { TemporaryQueueView } from './TemporaryQueueView';
 
 const CRM_ITEMS_PER_PAGE = 10;
 
@@ -127,6 +141,38 @@ interface FollowupCrmViewProps {
     legalBasis: string;
     notes: string;
   }) => Promise<void>;
+  // Cola Temporal de Sesión + Recuperación 12h/24h — opcional para compatibilidad retroactiva
+  temporaryQueue?: TemporaryQueueEntry[];
+  subView?: 'temporal' | 'crm';
+  onChangeSubView?: (view: 'temporal' | 'crm') => void;
+  temporaryTtlHours?: TemporaryQueueTtlHours;
+  onChangeTemporaryTtlHours?: (hours: TemporaryQueueTtlHours) => void;
+  isSyncingTemporaryQueue?: boolean;
+  temporaryRestorationNotice?: string | null;
+  onDismissTemporaryRestorationNotice?: () => void;
+  onUpdateTemporaryEntry?: (
+    placeId: string,
+    patch: Partial<{
+      outcome: TemporaryQueueOutcome;
+      notes: string;
+      followUpDate: string;
+      priorityLabel: TemporaryQueuePriority;
+      isSelected: boolean;
+      independentData: Partial<TemporaryQueueIndependentDraft>;
+    }>
+  ) => void;
+  onRemoveTemporarySelected?: (placeIds: string[]) => void;
+  onClearTemporaryQueue?: () => void;
+  onPromoteTemporaryEntry?: (entry: TemporaryQueueEntry) => Promise<string | null>;
+  onGoToExplorer?: () => void;
+  // Borrado controlado en Firestore (Fase 3)
+  onDeleteFollowupsBatch?: (
+    docIds: string[],
+    options: {
+      backupVerified: boolean;
+      onProgress?: (progress: BatchDeleteProgress) => void;
+    }
+  ) => Promise<BatchDeleteFollowupsResult>;
 }
 
 export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
@@ -144,7 +190,30 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
   onSignIn,
   onUpdateFollowup,
   onCreateManualFollowup,
+  temporaryQueue,
+  subView: controlledSubView,
+  onChangeSubView,
+  temporaryTtlHours = 24,
+  onChangeTemporaryTtlHours,
+  isSyncingTemporaryQueue = false,
+  temporaryRestorationNotice = null,
+  onDismissTemporaryRestorationNotice,
+  onUpdateTemporaryEntry,
+  onRemoveTemporarySelected,
+  onClearTemporaryQueue,
+  onPromoteTemporaryEntry,
+  onGoToExplorer,
+  onDeleteFollowupsBatch,
 }) => {
+  const hasTemporaryQueueSupport = Array.isArray(temporaryQueue);
+  const [internalSubView, setInternalSubView] = useState<'temporal' | 'crm'>(
+    hasTemporaryQueueSupport ? 'temporal' : 'crm'
+  );
+  const subView = controlledSubView ?? internalSubView;
+  const setSubView = (next: 'temporal' | 'crm') => {
+    setInternalSubView(next);
+    onChangeSubView?.(next);
+  };
   const [stageFilter, setStageFilter] = useState<'all' | FollowupStage>('all');
   const [queueFilter, setQueueFilter] = useState<'all' | 'complete_only' | 'incomplete_queue'>('all');
   const [searchTerm, setSearchTerm] = useState('');
@@ -154,6 +223,21 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [showCalibrationPanel, setShowCalibrationPanel] = useState(false);
   const [showCleanupPreviewPanel, setShowCleanupPreviewPanel] = useState(false);
+
+  // Fase 3: selección y borrado controlado de registros persistidos en Firestore
+  const [selectedFollowupIds, setSelectedFollowupIds] = useState<Set<string>>(new Set());
+  const [deleteDialogState, setDeleteDialogState] = useState<{
+    mode: 'selected' | 'all';
+    docIds: string[];
+    typedConfirmation: string;
+    backupDownloading: boolean;
+    backupDownloaded: boolean;
+    error: string | null;
+  } | null>(null);
+  const [isDeletingBatch, setIsDeletingBatch] = useState(false);
+  const [deleteProgress, setDeleteProgress] = useState<BatchDeleteProgress | null>(null);
+  const [deleteResultReport, setDeleteResultReport] =
+    useState<BatchDeleteFollowupsResult | null>(null);
 
   const [outcomeDraftType, setOutcomeDraftType] = useState<CommercialOutcomeType>('none');
   const [outcomeDraftSource, setOutcomeDraftSource] = useState('llamada_directa_webnex');
@@ -208,6 +292,9 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
   const [repairDistrict, setRepairDistrict] = useState('');
   const [repairEmail, setRepairEmail] = useState('');
   const [repairCategory, setRepairCategory] = useState('');
+  const [repairSocialUrl, setRepairSocialUrl] = useState('');
+  const [repairEvidenceText, setRepairEvidenceText] = useState('');
+  const [repairResearchResult, setRepairResearchResult] = useState<MissingDataResearchResult | null>(null);
   const [repairSource, setRepairSource] = useState<IndependentFieldSource>('user_manual_entry');
   const [repairConfirmed, setRepairConfirmed] = useState(false);
   const [repairCorroborating, setRepairCorroborating] = useState(false);
@@ -312,38 +399,16 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
       setRepairDistrict('');
       setRepairEmail('');
       setRepairCategory('');
+      setRepairSocialUrl('');
+      setRepairEvidenceText('');
+      setRepairResearchResult(null);
       setRepairSource('user_manual_entry');
       setRepairConfirmed(false);
       setRepairFeedback(null);
     }
   }, [openedRecord]);
 
-  if (!isSignedIn) {
-    return (
-      <div className="bg-white border border-slate-200 rounded-xl p-10 text-center">
-        <h2 className="text-lg font-semibold text-slate-900">
-          Seguimiento Comercial Privado (Firebase Firestore)
-        </h2>
-        <p className="text-sm text-slate-600 mt-2 max-w-lg mx-auto">
-          Inicia sesión con Google para gestionar tus prospectos preseleccionados y fichas comerciales persistentes bajo reglas estrictas por UID autorizado.
-        </p>
-        <button
-          type="button"
-          onClick={onSignIn}
-          className="mt-5 px-5 py-2.5 text-sm font-semibold bg-purple-700 text-white rounded-lg hover:bg-purple-800 transition-colors"
-        >
-          Iniciar sesión con Google
-        </button>
-      </div>
-    );
-  }
-
-  // En Seguimiento: CERO consultas a Google Places al abrir o revisar fichas.
-  const handleOpenRecord = (item: FollowupLeadRecord) => {
-    setOpenedRecordId(item.id);
-  };
-
-  const handleDownloadIntegrityBackup = async () => {
+  const triggerJsonBackupDownload = async (): Promise<FollowupIntegrityReport> => {
     setIsBackingUp(true);
     setBackupError(null);
     try {
@@ -351,7 +416,7 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
       setBackupReport(report);
 
       const backupPayload = {
-        exportedFrom: 'WEBNEX SYSTEMS - Seguimiento Firestore (solo datos propios permitidos)',
+        exportedFrom: `WEBNEX SYSTEMS - Seguimiento Firestore (${workspaceMode})`,
         backedUpAt: report.backedUpAt,
         integritySummary: {
           totalDocuments: report.totalDocuments,
@@ -366,17 +431,115 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `webnex_respaldo_followups_${new Date().toISOString().slice(0, 10)}.json`;
+      link.download = `webnex_respaldo_${workspaceMode}_${new Date().toISOString().slice(0, 10)}.json`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
-    } catch (err: any) {
-      setBackupError(err?.message || 'No se pudo generar el respaldo JSON desde Firestore.');
+      return report;
     } finally {
       setIsBackingUp(false);
     }
   };
+
+  const handleOpenRecord = (item: FollowupLeadRecord) => {
+    setOpenedRecordId(item.id);
+  };
+
+  const handleDownloadIntegrityBackup = async () => {
+    try {
+      await triggerJsonBackupDownload();
+    } catch (err: any) {
+      setBackupError(err?.message || 'No se pudo generar el respaldo JSON desde Firestore.');
+    }
+  };
+
+  const renderSubViewSwitcher = () =>
+    hasTemporaryQueueSupport ? (
+      <div className="bg-white border border-slate-200 rounded-xl p-2 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => setSubView('temporal')}
+            className={`px-3.5 py-2 text-xs font-semibold rounded-lg border transition-colors ${
+              subView === 'temporal'
+                ? 'bg-purple-700 text-white border-purple-700'
+                : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+            }`}
+          >
+            Cola Temporal de Sesión ({temporaryQueue!.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setSubView('crm')}
+            className={`px-3.5 py-2 text-xs font-semibold rounded-lg border transition-colors ${
+              subView === 'crm'
+                ? 'bg-purple-700 text-white border-purple-700'
+                : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+            }`}
+          >
+            CRM Definitivo Firestore ({followups.length})
+          </button>
+        </div>
+        <div className="text-[11px] text-slate-500 px-2">
+          {subView === 'temporal'
+            ? 'Sesión activa en RAM (0 Places Details)'
+            : `Colección Firestore: ${workspaceMode === 'sandbox' ? 'sandbox_followups' : 'followups'}`}
+        </div>
+      </div>
+    ) : null;
+
+  if (hasTemporaryQueueSupport && subView === 'temporal') {
+    return (
+      <div className="space-y-4">
+        {renderSubViewSwitcher()}
+        <TemporaryQueueView
+          queue={temporaryQueue!}
+          isSignedIn={isSignedIn}
+          workspaceMode={workspaceMode}
+          onChangeWorkspaceMode={(mode) => {
+            onChangeWorkspaceMode?.(mode);
+          }}
+          ttlHours={temporaryTtlHours}
+          onChangeTtlHours={onChangeTemporaryTtlHours}
+          isSyncingPersistence={isSyncingTemporaryQueue}
+          restorationNotice={temporaryRestorationNotice}
+          onDismissRestorationNotice={onDismissTemporaryRestorationNotice}
+          onUpdateEntry={(placeId, patch) => onUpdateTemporaryEntry?.(placeId, patch)}
+          onRemoveSelected={(placeIds) => onRemoveTemporarySelected?.(placeIds)}
+          onClearAll={() => onClearTemporaryQueue?.()}
+          onPromoteToCrm={async (entry) => {
+            if (!onPromoteTemporaryEntry) return null;
+            return onPromoteTemporaryEntry(entry);
+          }}
+          onGoToExplorer={() => onGoToExplorer?.()}
+        />
+      </div>
+    );
+  }
+
+  if (!isSignedIn) {
+    return (
+      <div className="space-y-4">
+        {renderSubViewSwitcher()}
+        <div className="bg-white border border-slate-200 rounded-xl p-10 text-center">
+          <h2 className="text-lg font-semibold text-slate-900">
+            CRM Definitivo Privado (Firebase Firestore)
+          </h2>
+          <p className="text-sm text-slate-600 mt-2 max-w-lg mx-auto">
+            Inicia sesión con Google para gestionar o limpiar tus fichas comerciales persistentes en Firestore bajo reglas estrictas por UID autorizado.
+          </p>
+          <button
+            type="button"
+            onClick={onSignIn}
+            className="mt-5 px-5 py-2.5 text-sm font-semibold bg-purple-700 text-white rounded-lg hover:bg-purple-800 transition-colors"
+          >
+            Iniciar sesión con Google
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const handleManualSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -421,8 +584,117 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
     await onUpdateFollowup(item.id, { stage: nextStage }, item);
   };
 
+  const expectedTypedConfirm =
+    workspaceMode === 'sandbox' ? 'ELIMINAR SANDBOX' : 'ELIMINAR PRODUCCION';
+
+  const startControlledFirestoreDelete = async (mode: 'selected' | 'all') => {
+    const targetIds =
+      mode === 'all'
+        ? followups.map((f) => f.id)
+        : followups.filter((f) => selectedFollowupIds.has(f.id)).map((f) => f.id);
+
+    if (targetIds.length === 0) return;
+
+    setDeleteResultReport(null);
+    setDeleteProgress(null);
+    setDeleteDialogState({
+      mode,
+      docIds: targetIds,
+      typedConfirmation: '',
+      backupDownloading: true,
+      backupDownloaded: false,
+      error: null,
+    });
+
+    try {
+      await triggerJsonBackupDownload();
+      setDeleteDialogState((prev) =>
+        prev
+          ? {
+              ...prev,
+              backupDownloading: false,
+              backupDownloaded: true,
+            }
+          : null
+      );
+    } catch (err: any) {
+      setDeleteDialogState((prev) =>
+        prev
+          ? {
+              ...prev,
+              backupDownloading: false,
+              backupDownloaded: false,
+              error:
+                err?.message ||
+                'No se pudo descargar el respaldo JSON obligatorio; el borrado permanece bloqueado.',
+            }
+          : null
+      );
+    }
+  };
+
+  const executeConfirmedFirestoreDelete = async () => {
+    if (!deleteDialogState || !onDeleteFollowupsBatch) return;
+    if (!deleteDialogState.backupDownloaded) return;
+    if (
+      deleteDialogState.mode === 'all' &&
+      deleteDialogState.typedConfirmation.trim() !== expectedTypedConfirm
+    ) {
+      setDeleteDialogState((prev) =>
+        prev
+          ? {
+              ...prev,
+              error: `Escribe exactamente "${expectedTypedConfirm}" para confirmar la limpieza total.`,
+            }
+          : null
+      );
+      return;
+    }
+
+    setIsDeletingBatch(true);
+    setDeleteDialogState((prev) => (prev ? { ...prev, error: null } : null));
+    setDeleteProgress({
+      processed: 0,
+      total: deleteDialogState.docIds.length,
+      deleted: 0,
+      failed: 0,
+    });
+
+    try {
+      const result = await onDeleteFollowupsBatch(deleteDialogState.docIds, {
+        backupVerified: true,
+        onProgress: (prog) => setDeleteProgress(prog),
+      });
+      setDeleteResultReport(result);
+      setSelectedFollowupIds((prev) => {
+        const next = new Set(prev);
+        for (const id of result.deletedIds) next.delete(id);
+        return next;
+      });
+      setDeleteDialogState(null);
+    } catch (err: any) {
+      setDeleteDialogState((prev) =>
+        prev
+          ? {
+              ...prev,
+              error: err?.message || 'Ocurrió un error al eliminar registros en Firestore.',
+            }
+          : null
+      );
+    } finally {
+      setIsDeletingBatch(false);
+    }
+  };
+
+  const visibleSelectedCount = paginatedFollowups.filter((f) =>
+    selectedFollowupIds.has(f.id)
+  ).length;
+  const allVisibleFollowupsSelected =
+    paginatedFollowups.length > 0 && visibleSelectedCount === paginatedFollowups.length;
+
   return (
     <div className="space-y-4">
+      {renderSubViewSwitcher()}
       {onChangeWorkspaceMode && (
         <div
           className={`rounded-xl border px-4 py-3 flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs ${
@@ -566,6 +838,164 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
           )}
         </div>
       </div>
+
+      {/* FASE 3: Limpieza controlada de Firestore (Producción y Sandbox) */}
+      {onDeleteFollowupsBatch && (
+        <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="text-xs space-y-0.5">
+              <div className="font-semibold text-slate-900">
+                Limpieza Controlada de Seguimiento en Firestore ({workspaceMode === 'sandbox' ? 'Sandbox' : 'Producción'})
+              </div>
+              <p className="text-[11px] text-slate-500">
+                Opera solo sobre <span className="font-mono-tabular">{workspaceMode === 'sandbox' ? 'users/{uid}/sandbox_followups' : 'users/{uid}/followups'}</span> ({followups.length} registros). Nunca toca Authentication, exclusiones, descartados ni reglas. Descarga respaldo JSON automáticamente antes de borrar.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={isDeletingBatch || selectedFollowupIds.size === 0}
+                onClick={() => startControlledFirestoreDelete('selected')}
+                className="px-3 py-1.5 text-xs font-semibold border border-rose-300 bg-rose-50 text-rose-900 rounded-lg hover:bg-rose-100 disabled:opacity-40 inline-flex items-center gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Respaldar JSON y eliminar seleccionados ({selectedFollowupIds.size})
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingBatch || followups.length === 0}
+                onClick={() => startControlledFirestoreDelete('all')}
+                className="px-3 py-1.5 text-xs font-semibold border border-rose-400 bg-white text-rose-800 rounded-lg hover:bg-rose-50 disabled:opacity-40"
+              >
+                Limpiar todos los registros ({followups.length})
+              </button>
+            </div>
+          </div>
+
+          {deleteDialogState && (
+            <div className="bg-rose-50 border border-rose-300 rounded-xl p-4 space-y-3 text-xs text-rose-950">
+              <div className="font-semibold flex items-center gap-1.5">
+                <AlertTriangle className="w-4 h-4 text-rose-700 shrink-0" />
+                {deleteDialogState.mode === 'all'
+                  ? `Confirmación crítica: eliminar TODOS los ${deleteDialogState.docIds.length} registros de ${workspaceMode === 'sandbox' ? 'Sandbox' : 'Producción'}`
+                  : `Confirmar eliminación de ${deleteDialogState.docIds.length} registro(s) seleccionado(s) en ${workspaceMode === 'sandbox' ? 'Sandbox' : 'Producción'}`}
+              </div>
+
+              <div className="text-[11px]">
+                {deleteDialogState.backupDownloading ? (
+                  <span className="font-medium text-purple-900">
+                    Generando y descargando respaldo JSON previo desde Firestore...
+                  </span>
+                ) : deleteDialogState.backupDownloaded ? (
+                  <span className="font-semibold text-emerald-800">
+                    Respaldo JSON verificado y descargado ({deleteDialogState.docIds.length} doc(s) marcados para borrado).
+                  </span>
+                ) : (
+                  <span className="text-rose-800 font-semibold">
+                    No se pudo completar el respaldo JSON previo.
+                  </span>
+                )}
+              </div>
+
+              {deleteDialogState.mode === 'all' && deleteDialogState.backupDownloaded && (
+                <div>
+                  <label className="block text-[11px] font-medium mb-1">
+                    Para confirmar esta limpieza total en Firestore, escribe{' '}
+                    <strong className="font-mono-tabular">{expectedTypedConfirm}</strong>:
+                  </label>
+                  <input
+                    type="text"
+                    value={deleteDialogState.typedConfirmation}
+                    onChange={(e) =>
+                      setDeleteDialogState((prev) =>
+                        prev ? { ...prev, typedConfirmation: e.target.value, error: null } : null
+                      )
+                    }
+                    placeholder={expectedTypedConfirm}
+                    className="w-full sm:w-72 px-3 py-1.5 border border-rose-300 rounded bg-white text-xs font-mono-tabular"
+                  />
+                </div>
+              )}
+
+              {deleteProgress && (
+                <div className="space-y-1">
+                  <div className="text-[11px] font-mono-tabular">
+                    Progreso de borrado: {deleteProgress.processed}/{deleteProgress.total} · Eliminados:{' '}
+                    {deleteProgress.deleted} · Errores: {deleteProgress.failed}
+                  </div>
+                  <div className="w-full bg-rose-200 rounded-full h-2 overflow-hidden">
+                    <div
+                      className="bg-rose-700 h-2 transition-all"
+                      style={{
+                        width: `${Math.round(
+                          (deleteProgress.processed / Math.max(1, deleteProgress.total)) * 100
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {deleteDialogState.error && (
+                <div className="text-xs text-rose-800 font-semibold bg-white border border-rose-200 rounded px-2.5 py-1.5">
+                  {deleteDialogState.error}
+                </div>
+              )}
+
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={
+                    isDeletingBatch ||
+                    deleteDialogState.backupDownloading ||
+                    !deleteDialogState.backupDownloaded
+                  }
+                  onClick={executeConfirmedFirestoreDelete}
+                  className="px-3.5 py-1.5 bg-rose-700 text-white font-semibold rounded-lg hover:bg-rose-800 disabled:opacity-40"
+                >
+                  {isDeletingBatch
+                    ? 'Eliminando en Firestore...'
+                    : `Ejecutar borrado (${deleteDialogState.docIds.length})`}
+                </button>
+                <button
+                  type="button"
+                  disabled={isDeletingBatch}
+                  onClick={() => setDeleteDialogState(null)}
+                  className="px-3 py-1.5 bg-white border border-slate-300 text-slate-700 rounded-lg"
+                >
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          )}
+
+          {deleteResultReport && (
+            <div
+              className={`rounded-lg border px-3 py-2 text-xs ${
+                deleteResultReport.failedItems.length > 0
+                  ? 'bg-amber-50 border-amber-300 text-amber-950'
+                  : 'bg-emerald-50 border-emerald-300 text-emerald-950'
+              }`}
+            >
+              <div>
+                Resultado en <span className="font-mono-tabular">{deleteResultReport.collectionPath}</span>:{' '}
+                <strong>{deleteResultReport.deletedIds.length}</strong> eliminado(s) de{' '}
+                <strong>{deleteResultReport.totalRequested}</strong> · Errores parciales:{' '}
+                <strong>{deleteResultReport.failedItems.length}</strong>.
+              </div>
+              {deleteResultReport.failedItems.length > 0 && (
+                <ul className="mt-1 text-[11px] space-y-0.5">
+                  {deleteResultReport.failedItems.slice(0, 5).map((f) => (
+                    <li key={f.id}>
+                      • {f.id}: {f.error}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {showCalibrationPanel && (
         <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
@@ -981,6 +1411,27 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
             <table className="w-full text-left border-collapse">
               <thead className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-700">
                 <tr>
+                  {onDeleteFollowupsBatch && (
+                    <th className="py-3 pl-4 pr-2 w-8">
+                      <input
+                        type="checkbox"
+                        checked={allVisibleFollowupsSelected}
+                        onChange={() => {
+                          setSelectedFollowupIds((prev) => {
+                            const next = new Set(prev);
+                            if (allVisibleFollowupsSelected) {
+                              for (const f of paginatedFollowups) next.delete(f.id);
+                            } else {
+                              for (const f of paginatedFollowups) next.add(f.id);
+                            }
+                            return next;
+                          });
+                        }}
+                        aria-label="Seleccionar registros visibles de Seguimiento"
+                        className="rounded border-slate-300 text-purple-700 focus:ring-purple-600"
+                      />
+                    </th>
+                  )}
                   <th className="py-3 px-4">Empresa, Dirección, Web y Procedencia</th>
                   <th className="py-3 px-3">Estado Comercial (9 etapas)</th>
                   <th className="py-3 px-3">Teléfono, Tipo y Autorización</th>
@@ -1019,6 +1470,24 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
 
                   return (
                     <tr key={item.id} className="hover:bg-slate-50 align-top">
+                      {onDeleteFollowupsBatch && (
+                        <td className="py-3 pl-4 pr-2">
+                          <input
+                            type="checkbox"
+                            checked={selectedFollowupIds.has(item.id)}
+                            onChange={() => {
+                              setSelectedFollowupIds((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(item.id)) next.delete(item.id);
+                                else next.add(item.id);
+                                return next;
+                              });
+                            }}
+                            aria-label={`Seleccionar documento ${item.id}`}
+                            className="mt-1 rounded border-slate-300 text-purple-700 focus:ring-purple-600"
+                          />
+                        </td>
+                      )}
                       <td className="py-3 px-4 max-w-[330px]">
                         {persistedName ? (
                           <div className="font-semibold text-slate-900">{persistedName}</div>
@@ -1158,6 +1627,9 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
                             CLIENTE confirmado (etapa bloqueada)
                           </div>
                         )}
+                        <div className="text-[10px] text-slate-600 mt-1.5 font-medium">
+                          {evaluateFourStagePipelineStatus(item).currentStageLabel}
+                        </div>
                       </td>
 
                       <td className="py-3 px-3 max-w-[270px]">
@@ -1655,70 +2127,163 @@ export const FollowupCrmView: React.FC<FollowupCrmViewProps> = ({
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div>
                           <div className="font-semibold text-emerald-950">
-                            Completar solo campos vacíos en Firestore (reparación segura sin sobrescribir)
+                            Investigar y completar solo campos vacíos en Firestore (0 Places · sin sobrescribir)
                           </div>
                           <div className="text-[11px] text-emerald-900/80">
-                            Conserva intactos teléfono, correo, distrito, categoría, etapa, notas, base legal y fechas ya guardadas.
+                            Conserva intactos teléfono, correo, distrito, categoría, etapa, notas, base legal y fechas ya guardadas. Etapa embudo:{' '}
+                            <strong>{evaluateFourStagePipelineStatus(openedRecord).currentStageLabel}</strong>.
                           </div>
                         </div>
-                        {(repairWebsite.trim() || openedRecord.independentWebsite?.trim()) && (
-                          <button
-                            type="button"
-                            disabled={repairCorroborating}
-                            onClick={async () => {
-                              setRepairCorroborating(true);
-                              setRepairFeedback(null);
-                              try {
-                                const url =
-                                  repairWebsite.trim() || openedRecord.independentWebsite || '';
-                                const resList = await corroborateLeadsIndependently([
-                                  {
-                                    placeId: openedRecord.placeId,
-                                    officialWebsiteUrl: url,
-                                    notesText: openedRecord.notes,
-                                    searchCategory: openedRecord.independentCategory || '',
-                                    searchDistrict: openedRecord.district || '',
-                                  },
-                                ]);
-                                const corr = resList[0];
-                                if (corr) {
-                                  if (!openedRecord.independentBusinessName?.trim() && !repairName.trim() && corr.candidates.businessName?.value) {
-                                    setRepairName(corr.candidates.businessName.value);
-                                  }
-                                  if (!openedRecord.independentAddress?.trim() && !repairAddress.trim() && corr.candidates.address?.value) {
-                                    setRepairAddress(corr.candidates.address.value);
-                                  }
-                                  if (!openedRecord.independentWebsite?.trim() && !repairWebsite.trim() && corr.candidates.website?.value) {
-                                    setRepairWebsite(corr.candidates.website.value);
-                                  }
-                                  if (!openedRecord.independentPhone?.trim() && !repairPhone.trim() && corr.candidates.phone?.value) {
-                                    setRepairPhone(corr.candidates.phone.value);
-                                  }
-                                  if (!openedRecord.district?.trim() && !repairDistrict.trim() && corr.candidates.district?.value) {
-                                    setRepairDistrict(corr.candidates.district.value);
-                                  }
-                                  if (!openedRecord.independentEmail?.trim() && !repairEmail.trim() && corr.candidates.email?.value) {
-                                    setRepairEmail(corr.candidates.email.value);
-                                  }
-                                  if (!openedRecord.independentCategory?.trim() && !repairCategory.trim() && corr.candidates.category?.value) {
-                                    setRepairCategory(corr.candidates.category.value);
-                                  }
-                                  setRepairSource('official_website_html');
-                                  setRepairFeedback(`${corr.summary} (0 Places).`);
+                        <button
+                          type="button"
+                          disabled={repairCorroborating}
+                          onClick={async () => {
+                            setRepairCorroborating(true);
+                            setRepairFeedback(null);
+                            try {
+                              const url =
+                                repairWebsite.trim() || openedRecord.independentWebsite || '';
+                              const evidenceClean = repairEvidenceText.trim();
+                              const response = await researchMissingLeadDataBatch([
+                                {
+                                  placeId: openedRecord.placeId,
+                                  officialWebsiteUrl: url || null,
+                                  socialOrDirectoryUrl: repairSocialUrl.trim() || null,
+                                  userProvidedEvidenceText: evidenceClean,
+                                  notesText: openedRecord.notes,
+                                  searchCategory: openedRecord.independentCategory || '',
+                                  searchDistrict: openedRecord.district || '',
+                                  allowGeminiEvidenceAnalysis: evidenceClean.length >= 15,
+                                  sessionMapsRef: usableDetails
+                                    ? {
+                                        name: usableDetails.displayName,
+                                        address: usableDetails.formattedAddress,
+                                        phone:
+                                          usableDetails.internationalPhoneNumber ||
+                                          usableDetails.nationalPhoneNumber ||
+                                          '',
+                                        website: usableDetails.websiteUri || '',
+                                        district: openedRecord.district || '',
+                                      }
+                                    : undefined,
+                                },
+                              ]);
+                              const research = response.results[0];
+                              if (research) {
+                                setRepairResearchResult(research);
+                                const corr = research.corroboration;
+                                if (!openedRecord.independentBusinessName?.trim() && !repairName.trim() && corr.candidates.businessName?.value) {
+                                  setRepairName(corr.candidates.businessName.value);
                                 }
-                              } catch (err: any) {
-                                setRepairFeedback(err?.message || 'Error al corroborar web oficial.');
-                              } finally {
-                                setRepairCorroborating(false);
+                                if (!openedRecord.independentAddress?.trim() && !repairAddress.trim() && corr.candidates.address?.value) {
+                                  setRepairAddress(corr.candidates.address.value);
+                                }
+                                if (!openedRecord.independentWebsite?.trim() && !repairWebsite.trim() && corr.candidates.website?.value) {
+                                  setRepairWebsite(corr.candidates.website.value);
+                                }
+                                if (!research.hasContradictions && !openedRecord.independentPhone?.trim() && !repairPhone.trim() && corr.candidates.phone?.value) {
+                                  setRepairPhone(corr.candidates.phone.value);
+                                }
+                                if (!openedRecord.district?.trim() && !repairDistrict.trim() && corr.candidates.district?.value) {
+                                  setRepairDistrict(corr.candidates.district.value);
+                                }
+                                if (!openedRecord.independentEmail?.trim() && !repairEmail.trim() && corr.candidates.email?.value) {
+                                  setRepairEmail(corr.candidates.email.value);
+                                }
+                                if (!openedRecord.independentCategory?.trim() && !repairCategory.trim() && corr.candidates.category?.value) {
+                                  setRepairCategory(corr.candidates.category.value);
+                                }
+                                if (corr.candidates.businessName?.source) {
+                                  setRepairSource(corr.candidates.businessName.source);
+                                } else if (corr.candidates.address?.source) {
+                                  setRepairSource(corr.candidates.address.source);
+                                }
+                                setRepairFeedback(`${research.summary} (0 Places).`);
                               }
-                            }}
-                            className="px-2.5 py-1.5 text-[11px] font-semibold bg-purple-700 text-white rounded-md hover:bg-purple-800 disabled:opacity-50 inline-flex items-center gap-1"
-                          >
-                            <Globe className="w-3 h-3" />
-                            {repairCorroborating ? 'Corroborando...' : 'Corroborar Web Oficial (0 Places)'}
-                          </button>
-                        )}
+                            } catch (err: any) {
+                              setRepairFeedback(err?.message || 'Error investigando fuentes independientes.');
+                            } finally {
+                              setRepairCorroborating(false);
+                            }
+                          }}
+                          className="px-2.5 py-1.5 text-[11px] font-semibold bg-purple-700 text-white rounded-md hover:bg-purple-800 disabled:opacity-50 inline-flex items-center gap-1"
+                        >
+                          <Search className="w-3 h-3" />
+                          {repairCorroborating
+                            ? 'Investigando (0 Places)...'
+                            : 'Investigar datos faltantes (0 Places)'}
+                        </button>
                       </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <input
+                          type="url"
+                          value={repairSocialUrl}
+                          onChange={(e) => setRepairSocialUrl(e.target.value)}
+                          placeholder="URL Facebook / Instagram / DatosPeru (opcional)"
+                          className="px-2.5 py-1.5 text-xs border border-emerald-200 rounded bg-white"
+                        />
+                        <input
+                          type="text"
+                          value={repairEvidenceText}
+                          onChange={(e) => setRepairEvidenceText(e.target.value)}
+                          placeholder="Texto / evidencia propia (extracción literal 0 invención)"
+                          className="px-2.5 py-1.5 text-xs border border-emerald-200 rounded bg-white"
+                        />
+                      </div>
+
+                      {repairResearchResult && (
+                        <div className="bg-white border border-emerald-200 rounded p-2.5 space-y-2 text-[11px]">
+                          <div className="font-semibold text-slate-800">
+                            {repairResearchResult.identityMatch.summary}
+                          </div>
+                          {repairResearchResult.contradictionAlerts.length > 0 && (
+                            <div className="bg-rose-50 border border-rose-300 text-rose-900 rounded px-2 py-1">
+                              {repairResearchResult.contradictionAlerts.map((a, idx) => (
+                                <div key={idx}>• {a}</div>
+                              ))}
+                            </div>
+                          )}
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                            {(['businessName', 'phone', 'address', 'website'] as ResearchableFieldKey[]).map((fk) => {
+                              const fc = repairResearchResult.fieldClassifications[fk];
+                              const meta = getFieldClassificationMeta(fc.status);
+                              return (
+                                <div key={fk} className="bg-slate-50 border border-slate-200 rounded p-1.5">
+                                  <div className="font-semibold text-slate-700">{fc.label}</div>
+                                  <div className={`inline-block px-1 py-0.5 text-[10px] border rounded mt-0.5 ${meta.badgeClass}`}>
+                                    {meta.shortLabel}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                          <div className="space-y-0.5 text-[10px] text-slate-600">
+                            {repairResearchResult.sourceAttempts.map((att, idx) => (
+                              <div key={idx}>
+                                • <strong>{att.sourceName}</strong> ({att.status}
+                                {att.httpStatus ? ` · HTTP ${att.httpStatus}` : ''}): {att.detail}
+                              </div>
+                            ))}
+                          </div>
+                          {repairResearchResult.manualReviewLinks.length > 0 && (
+                            <div className="flex flex-wrap gap-2 pt-1 border-t border-slate-100">
+                              {repairResearchResult.manualReviewLinks.map((lnk, i) => (
+                                <a
+                                  key={i}
+                                  href={lnk.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 text-purple-700 hover:underline font-medium"
+                                >
+                                  {lnk.label}
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
 
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                         {!openedRecord.independentBusinessName?.trim() && (

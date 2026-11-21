@@ -327,5 +327,160 @@ service cloud.firestore {
       allow update: if isOwner(userId) && isValidId(followupId) && isAllowedFollowupUpdate(userId);
       allow delete: if isOwner(userId) && isValidId(followupId) && existing().ownerUid == request.auth.uid;
     }
+
+    function isValidTemporaryWorkOutcome(outcome) {
+      return outcome in [
+        'pendiente',
+        'contacto_no_autorizado',
+        'numero_incorrecto',
+        'no_responde',
+        'contacto_alcanzado',
+        'no_interesado',
+        'interesado',
+        'cotizacion',
+        'cliente',
+        'descartado'
+      ];
+    }
+
+    function isValidTemporaryWorkItem(data, userId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'placeId',
+          'outcome',
+          'notes',
+          'followUpDate',
+          'isSelected',
+          'priorityLabel',
+          'ttlHours',
+          'expiresAtEpochMs',
+          'searchCategory',
+          'searchDistrict',
+          'provenanceConfirmed',
+          'independentBusinessName',
+          'independentPhone',
+          'independentAddress',
+          'district',
+          'independentWebsite',
+          'independentEmail',
+          'independentCategory',
+          'confirmedNoWebsite',
+          'legalBasis',
+          'independentDataProvenance',
+          'promotedToCrmId',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'placeId',
+          'outcome',
+          'notes',
+          'followUpDate',
+          'isSelected',
+          'priorityLabel',
+          'ttlHours',
+          'expiresAtEpochMs',
+          'searchCategory',
+          'searchDistrict',
+          'provenanceConfirmed',
+          'independentBusinessName',
+          'independentPhone',
+          'independentAddress',
+          'district',
+          'independentWebsite',
+          'independentEmail',
+          'independentCategory',
+          'confirmedNoWebsite',
+          'legalBasis',
+          'independentDataProvenance',
+          'promotedToCrmId',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.ownerUid is string && data.ownerUid == userId &&
+        data.placeId is string && isValidId(data.placeId) &&
+        data.outcome is string && isValidTemporaryWorkOutcome(data.outcome) &&
+        data.notes is string && data.notes.size() <= 1000 &&
+        data.followUpDate is string && data.followUpDate.size() <= 40 &&
+        data.isSelected is bool &&
+        data.priorityLabel in ['alta', 'normal', 'baja'] &&
+        data.ttlHours in [12, 24] &&
+        data.expiresAtEpochMs is number && data.expiresAtEpochMs > 0 &&
+        data.searchCategory is string && data.searchCategory.size() <= 120 &&
+        data.searchDistrict is string && data.searchDistrict.size() <= 120 &&
+        data.provenanceConfirmed is bool &&
+        data.independentBusinessName is string && data.independentBusinessName.size() <= 160 &&
+        data.independentPhone is string && data.independentPhone.size() <= 40 &&
+        data.independentAddress is string && data.independentAddress.size() <= 200 &&
+        data.district is string && data.district.size() <= 120 &&
+        data.independentWebsite is string && data.independentWebsite.size() <= 300 &&
+        data.independentEmail is string && data.independentEmail.size() <= 160 &&
+        data.independentCategory is string && data.independentCategory.size() <= 120 &&
+        data.confirmedNoWebsite is bool &&
+        data.legalBasis is string && data.legalBasis.size() <= 300 &&
+        data.independentDataProvenance is string && data.independentDataProvenance.size() <= 160 &&
+        data.promotedToCrmId is string && data.promotedToCrmId.size() <= 160 &&
+        // Zero-Maps-Persistence Gate: campos comerciales de terceros solo pueden guardarse con procedencia independiente confirmada
+        (
+          (
+            data.provenanceConfirmed == true &&
+            data.independentDataProvenance.size() >= 3
+          ) ||
+          (
+            data.provenanceConfirmed == false &&
+            data.independentBusinessName == '' &&
+            data.independentPhone == '' &&
+            data.independentAddress == '' &&
+            data.independentWebsite == '' &&
+            data.independentEmail == ''
+          )
+        ) &&
+        data.createdAt is timestamp &&
+        data.updatedAt == request.time;
+    }
+
+    function isAllowedTemporaryWorkItemUpdate(userId) {
+      return isValidTemporaryWorkItem(incoming(), userId) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().placeId == existing().placeId &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'outcome',
+          'notes',
+          'followUpDate',
+          'isSelected',
+          'priorityLabel',
+          'ttlHours',
+          'expiresAtEpochMs',
+          'searchCategory',
+          'searchDistrict',
+          'provenanceConfirmed',
+          'independentBusinessName',
+          'independentPhone',
+          'independentAddress',
+          'district',
+          'independentWebsite',
+          'independentEmail',
+          'independentCategory',
+          'confirmedNoWebsite',
+          'legalBasis',
+          'independentDataProvenance',
+          'promotedToCrmId',
+          'updatedAt'
+        ]);
+    }
+
+    match /users/{userId}/temporary_work_queue/{itemId} {
+      allow get: if isOwner(userId) && isValidId(itemId);
+      allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+      allow create: if isOwner(userId) && isValidId(itemId) &&
+        isValidTemporaryWorkItem(incoming(), userId) &&
+        incoming().createdAt == request.time;
+      allow update: if isOwner(userId) && isValidId(itemId) &&
+        isAllowedTemporaryWorkItemUpdate(userId);
+      allow delete: if isOwner(userId) && isValidId(itemId) &&
+        existing().ownerUid == request.auth.uid;
+    }
   }
 }

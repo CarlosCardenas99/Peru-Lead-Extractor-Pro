@@ -355,11 +355,109 @@ export type IndependentFieldSource =
   | 'official_website_jsonld'
   | 'official_website_html'
   | 'authorized_public_source'
+  | 'meta_graph_api'
   | 'user_manual_entry'
   | 'phone_call_verified'
   | 'user_search_context'
   | 'ssrf_http_probe'
   | 'none';
+
+export type FieldClassificationStatus =
+  | 'corroborated_persistable'
+  | 'maps_session_only'
+  | 'contradictory'
+  | 'not_found';
+
+export type ResearchableFieldKey =
+  | 'businessName'
+  | 'phone'
+  | 'address'
+  | 'district'
+  | 'website'
+  | 'email'
+  | 'category';
+
+export interface FieldResearchClassification {
+  field: ResearchableFieldKey;
+  label: string;
+  status: FieldClassificationStatus;
+  independentValue: string | null;
+  mapsSessionValue: string | null;
+  source: IndependentFieldSource;
+  sourceLabel: string;
+  evidenceUrl: string | null;
+  reason: string;
+}
+
+export interface IdentityMatchSignals {
+  overallConfidence: 'high' | 'medium' | 'low' | 'conflict' | 'unconfirmed' | 'none';
+  identityStatusLabel?:
+    | 'IDENTIDAD CONFIRMADA'
+    | 'COINCIDENCIA PARCIAL'
+    | 'CONFLICTO DE IDENTIDAD'
+    | 'IDENTIDAD NO CONFIRMADA';
+  matchedSignals: Array<'name' | 'district' | 'address' | 'phone' | 'category'>;
+  conflictingSignals: Array<'name' | 'district' | 'address' | 'phone' | 'category'>;
+  nameSimilarity: number;
+  districtMatches: boolean | null;
+  addressMatches: boolean | null;
+  phoneMatches: boolean | null;
+  categoryCompatible?: boolean | null;
+  rejectionReasons?: string[];
+  summary: string;
+}
+
+export interface SourceConsultationAttempt {
+  sourceId:
+    | 'official_website'
+    | 'meta_social'
+    | 'datosperu_ruc'
+    | 'directory_reference'
+    | 'user_evidence_gemini';
+  sourceName: string;
+  status: 'found' | 'not_found' | 'blocked_or_restricted' | 'skipped' | 'error';
+  httpStatus: number | null;
+  checkedUrl: string | null;
+  retentionPermitted: boolean;
+  costNote: string;
+  detail: string;
+}
+
+export interface MissingDataResearchItemInput {
+  placeId: string;
+  officialWebsiteUrl?: string | null;
+  socialOrDirectoryUrl?: string | null;
+  userProvidedEvidenceText?: string;
+  notesText?: string;
+  searchCategory?: string;
+  searchDistrict?: string;
+  allowGeminiEvidenceAnalysis?: boolean;
+  sessionMapsRef?: {
+    name?: string;
+    address?: string;
+    phone?: string;
+    website?: string;
+    district?: string;
+  };
+}
+
+export interface MissingDataResearchResult {
+  placeId: string;
+  needsIndependentData: boolean;
+  canPersistCompleteCard: boolean;
+  hasContradictions: boolean;
+  recommendedQueue: 'complete_ready' | 'research_queue';
+  missingPersistableFields: string[];
+  contradictionAlerts: string[];
+  identityMatch: IdentityMatchSignals;
+  fieldClassifications: Record<ResearchableFieldKey, FieldResearchClassification>;
+  sourceAttempts: SourceConsultationAttempt[];
+  corroboration: IndependentCorroborationResult;
+  manualReviewLinks: Array<{ label: string; url: string; note: string }>;
+  usedGemini: boolean;
+  summary: string;
+  researchedAt: string;
+}
 
 export type GooglePlacesStoragePolicy =
   | 'PERMITTED_PERMANENT_ID'
@@ -484,3 +582,156 @@ export interface IndependentFunnelMetrics {
   qualifiedOpportunities: number;
   confirmedSales: number;
 }
+
+export type TemporaryQueueOutcome =
+  | 'pendiente'
+  | 'contacto_no_autorizado'
+  | 'numero_incorrecto'
+  | 'no_responde'
+  | 'contacto_alcanzado'
+  | 'no_interesado'
+  | 'interesado'
+  | 'cotizacion'
+  | 'cliente'
+  | 'descartado';
+
+export interface TemporaryQueueOutcomeMeta {
+  value: TemporaryQueueOutcome;
+  label: string;
+  badgeClass: string;
+  requiresLegalAuthorizationForCrm: boolean;
+}
+
+export const TEMPORARY_QUEUE_OUTCOMES: TemporaryQueueOutcomeMeta[] = [
+  {
+    value: 'pendiente',
+    label: 'Pendiente',
+    badgeClass: 'bg-slate-100 text-slate-800 border-slate-300',
+    requiresLegalAuthorizationForCrm: false,
+  },
+  {
+    value: 'contacto_no_autorizado',
+    label: 'Contacto no autorizado',
+    badgeClass: 'bg-amber-50 text-amber-900 border-amber-300',
+    requiresLegalAuthorizationForCrm: false,
+  },
+  {
+    value: 'numero_incorrecto',
+    label: 'Número incorrecto',
+    badgeClass: 'bg-rose-50 text-rose-800 border-rose-300',
+    requiresLegalAuthorizationForCrm: false,
+  },
+  {
+    value: 'no_responde',
+    label: 'No responde',
+    badgeClass: 'bg-slate-100 text-slate-700 border-slate-300',
+    requiresLegalAuthorizationForCrm: true,
+  },
+  {
+    value: 'contacto_alcanzado',
+    label: 'Contacto alcanzado',
+    badgeClass: 'bg-sky-50 text-sky-900 border-sky-300',
+    requiresLegalAuthorizationForCrm: true,
+  },
+  {
+    value: 'no_interesado',
+    label: 'No interesado',
+    badgeClass: 'bg-slate-100 text-slate-600 border-slate-300',
+    requiresLegalAuthorizationForCrm: true,
+  },
+  {
+    value: 'interesado',
+    label: 'Interesado',
+    badgeClass: 'bg-purple-50 text-purple-900 border-purple-300',
+    requiresLegalAuthorizationForCrm: true,
+  },
+  {
+    value: 'cotizacion',
+    label: 'Cotización',
+    badgeClass: 'bg-indigo-50 text-indigo-900 border-indigo-300',
+    requiresLegalAuthorizationForCrm: true,
+  },
+  {
+    value: 'cliente',
+    label: 'Cliente',
+    badgeClass: 'bg-emerald-50 text-emerald-900 border-emerald-300',
+    requiresLegalAuthorizationForCrm: true,
+  },
+  {
+    value: 'descartado',
+    label: 'Descartado',
+    badgeClass: 'bg-rose-50 text-rose-900 border-rose-300',
+    requiresLegalAuthorizationForCrm: false,
+  },
+];
+
+export type TemporaryQueueTtlHours = 12 | 24;
+
+export type TemporaryQueuePriority = 'alta' | 'normal' | 'baja';
+
+export interface TemporaryQueueIndependentDraft {
+  independentBusinessName: string;
+  independentPhone: string;
+  independentAddress: string;
+  district: string;
+  independentWebsite: string;
+  independentEmail: string;
+  independentCategory: string;
+  confirmedNoWebsite: boolean;
+  legalBasis: string;
+  provenanceConfirmed: boolean;
+  independentDataProvenance?: string;
+}
+
+export interface TemporaryQueueEntry {
+  placeId: string;
+  // Objeto vivo ya cargado en sesión por Explorador (0 llamadas adicionales; nunca guardado en Firestore/localStorage)
+  lead: BusinessLead;
+  addedAt: string;
+  updatedAt?: string;
+  followUpDate?: string;
+  priorityLabel?: TemporaryQueuePriority;
+  isSelected?: boolean;
+  ttlHours?: TemporaryQueueTtlHours;
+  expiresAt?: string;
+  mapsSessionAvailable?: boolean;
+  restoredFromPersistence?: boolean;
+  searchCategory?: string;
+  searchDistrict?: string;
+  outcome: TemporaryQueueOutcome;
+  notes: string;
+  // Datos propios opcionales capturados/corroborados independientemente en sesión para traslado o recuperación 12h/24h
+  independentData: TemporaryQueueIndependentDraft;
+  promotedToCrmId?: string;
+}
+
+export interface PersistedTemporaryWorkItem {
+  id: string;
+  ownerUid: string;
+  placeId: string;
+  outcome: TemporaryQueueOutcome;
+  notes: string;
+  followUpDate: string;
+  isSelected: boolean;
+  priorityLabel: TemporaryQueuePriority;
+  ttlHours: TemporaryQueueTtlHours;
+  expiresAtEpochMs: number;
+  searchCategory: string;
+  searchDistrict: string;
+  provenanceConfirmed: boolean;
+  independentBusinessName: string;
+  independentPhone: string;
+  independentAddress: string;
+  district: string;
+  independentWebsite: string;
+  independentEmail: string;
+  independentCategory: string;
+  confirmedNoWebsite: boolean;
+  legalBasis: string;
+  independentDataProvenance: string;
+  promotedToCrmId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+

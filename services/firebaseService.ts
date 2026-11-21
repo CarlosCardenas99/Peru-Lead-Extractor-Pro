@@ -39,9 +39,15 @@ import {
   FollowupIntegrityReport,
   FollowupLeadRecord,
   FollowupStage,
+  PersistedTemporaryWorkItem,
   PhoneLineType,
   PhoneVerificationStage,
   QualificationTier,
+  TEMPORARY_QUEUE_OUTCOMES,
+  TemporaryQueueEntry,
+  TemporaryQueueOutcome,
+  TemporaryQueuePriority,
+  TemporaryQueueTtlHours,
   WebsiteVerificationStatus,
 } from '../types';
 import { ParsedExclusionCandidate } from '../utils/exclusionUtils';
@@ -1511,3 +1517,387 @@ export function buildSafeLegacyCleanupPreview(
       : 'Se requiere verificar el respaldo JSON antes de autorizar cualquier limpieza futura.',
   };
 }
+
+export interface BatchDeleteProgress {
+  processed: number;
+  total: number;
+  deleted: number;
+  failed: number;
+}
+
+export interface BatchDeleteFailedItem {
+  id: string;
+  error: string;
+}
+
+export interface BatchDeleteFollowupsResult {
+  workspaceMode: CrmWorkspaceMode;
+  collectionPath: string;
+  totalRequested: number;
+  deletedIds: string[];
+  failedItems: BatchDeleteFailedItem[];
+  abortedReason?: string;
+}
+
+export interface FirestoreDeleteBatchAdapter {
+  commitDeleteChunk: (collectionPath: string, ids: string[]) => Promise<void>;
+  deleteSingleDoc: (collectionPath: string, id: string) => Promise<void>;
+}
+
+const defaultFirestoreDeleteAdapter: FirestoreDeleteBatchAdapter = {
+  async commitDeleteChunk(collectionPath: string, ids: string[]) {
+    const batch = writeBatch(db);
+    for (const id of ids) {
+      batch.delete(doc(db, collectionPath, id));
+    }
+    await batch.commit();
+  },
+  async deleteSingleDoc(collectionPath: string, id: string) {
+    await deleteDoc(doc(db, collectionPath, id));
+  },
+};
+
+/**
+ * FASE 3 — Borrado controlado de registros de Seguimiento en Firestore (Producción o Sandbox).
+ * - Exige backupVerified === true previo a ejecutar.
+ * - Opera EXCLUSIVAMENTE sobre users/{uid}/followups o users/{uid}/sandbox_followups.
+ * - Nunca toca exclusions, discards, usuarios, reglas ni Auth.
+ * - Ejecuta en lotes (<= 400) reportando progreso y aislando errores parciales por ID.
+ */
+export async function deleteFollowupsBatchWithProgress(
+  options: {
+    uid: string;
+    workspaceMode: CrmWorkspaceMode;
+    docIds: string[];
+    backupVerified: boolean;
+    chunkSize?: number;
+    onProgress?: (progress: BatchDeleteProgress) => void;
+  },
+  adapter: FirestoreDeleteBatchAdapter = defaultFirestoreDeleteAdapter
+): Promise<BatchDeleteFollowupsResult> {
+  const { uid, workspaceMode, backupVerified, onProgress } = options;
+  if (!uid || !uid.trim()) {
+    throw new Error('UID de usuario requerido para eliminar registros en Firestore.');
+  }
+  if (!backupVerified) {
+    throw new Error(
+      'Debes generar y descargar primero el respaldo JSON de Seguimiento antes de eliminar registros en Firestore.'
+    );
+  }
+
+  const collectionPath = getFollowupsCollectionPath(uid, workspaceMode);
+  if (!collectionPath.endsWith('/followups') && !collectionPath.endsWith('/sandbox_followups')) {
+    throw new Error(`Ruta de colección no autorizada para limpieza de Seguimiento: ${collectionPath}`);
+  }
+
+  const uniqueIds = Array.from(
+    new Set(
+      (options.docIds || [])
+        .map((id) => sanitizeFirestoreId(id.trim()))
+        .filter((id) => Boolean(id))
+    )
+  );
+
+  const totalRequested = uniqueIds.length;
+  const deletedIds: string[] = [];
+  const failedItems: BatchDeleteFailedItem[] = [];
+
+  if (totalRequested === 0) {
+    return {
+      workspaceMode,
+      collectionPath,
+      totalRequested: 0,
+      deletedIds: [],
+      failedItems: [],
+    };
+  }
+
+  const safeChunkSize = Math.max(1, Math.min(400, options.chunkSize ?? 25));
+  let processed = 0;
+
+  for (let i = 0; i < uniqueIds.length; i += safeChunkSize) {
+    const chunk = uniqueIds.slice(i, i + safeChunkSize);
+    try {
+      await adapter.commitDeleteChunk(collectionPath, chunk);
+      deletedIds.push(...chunk);
+      processed += chunk.length;
+      onProgress?.({
+        processed,
+        total: totalRequested,
+        deleted: deletedIds.length,
+        failed: failedItems.length,
+      });
+    } catch {
+      // Fallback por documento para aislar fallos parciales y no perder progreso de los demás IDs
+      for (const id of chunk) {
+        const docPath = `${collectionPath}/${id}`;
+        try {
+          await adapter.deleteSingleDoc(collectionPath, id);
+          deletedIds.push(id);
+        } catch (singleErr) {
+          let errMsg = singleErr instanceof Error ? singleErr.message : String(singleErr);
+          if (errMsg.includes('Missing or insufficient permissions')) {
+            try {
+              handleFirestoreError(singleErr, OperationType.DELETE, docPath);
+            } catch (formattedErr) {
+              errMsg = formattedErr instanceof Error ? formattedErr.message : errMsg;
+            }
+          }
+          failedItems.push({ id, error: errMsg });
+        }
+        processed += 1;
+        onProgress?.({
+          processed,
+          total: totalRequested,
+          deleted: deletedIds.length,
+          failed: failedItems.length,
+        });
+      }
+    }
+  }
+
+  return {
+    workspaceMode,
+    collectionPath,
+    totalRequested,
+    deletedIds,
+    failedItems,
+  };
+}
+
+const ALLOWED_TEMPORARY_OUTCOMES = new Set<TemporaryQueueOutcome>(
+  TEMPORARY_QUEUE_OUTCOMES.map((o) => o.value)
+);
+
+const ALLOWED_TEMPORARY_PRIORITIES = new Set<TemporaryQueuePriority>(['alta', 'normal', 'baja']);
+
+export function getTemporaryWorkQueueCollectionPath(uid: string): string {
+  return `users/${uid}/temporary_work_queue`;
+}
+
+/**
+ * Construye el payload seguro para /users/{uid}/temporary_work_queue/{itemId} con TTL lógico (12h o 24h).
+ * - Guarda EXCLUSIVAMENTE: Place ID, notas propias, resultado de gestión, fecha de seguimiento,
+ *   selecciones/prioridades propias y datos comerciales independientes autorizados.
+ * - NUNCA persiste contenido restringido de Google Maps (nombre/teléfono/dirección/web de Maps);
+ *   si provenanceConfirmed !== true, los campos comerciales de terceros se fuerzan a ''.
+ */
+export function buildTemporaryWorkItemPayload(
+  uid: string,
+  entry: TemporaryQueueEntry,
+  ttlHours: TemporaryQueueTtlHours = 24,
+  options?: { nowMs?: number; timestampValue?: unknown }
+): Record<string, unknown> {
+  const cleanPlaceId = sanitizeFirestoreId(entry.placeId || '');
+  if (!cleanPlaceId) {
+    throw new Error('Place ID válido requerido para respaldar elemento de cola temporal.');
+  }
+  const safeTtl: TemporaryQueueTtlHours = ttlHours === 12 ? 12 : 24;
+  const nowMs = options?.nowMs ?? Date.now();
+  const expiresAtEpochMs = nowMs + safeTtl * 60 * 60 * 1000;
+  const ts = options?.timestampValue ?? serverTimestamp();
+
+  const outcome: TemporaryQueueOutcome = ALLOWED_TEMPORARY_OUTCOMES.has(entry.outcome)
+    ? entry.outcome
+    : 'pendiente';
+  const priorityLabel: TemporaryQueuePriority =
+    entry.priorityLabel && ALLOWED_TEMPORARY_PRIORITIES.has(entry.priorityLabel)
+      ? entry.priorityLabel
+      : 'normal';
+
+  const ind = entry.independentData;
+  const provenanceConfirmed = Boolean(ind.provenanceConfirmed);
+  const rawProvenance = (ind.independentDataProvenance || '').trim();
+  const effectiveProvenance = provenanceConfirmed
+    ? (rawProvenance || 'user_manual_entry').slice(0, 160)
+    : '';
+
+  return {
+    ownerUid: uid,
+    placeId: cleanPlaceId,
+    outcome,
+    notes: (entry.notes || '').trim().slice(0, 1000),
+    followUpDate: (entry.followUpDate || '').trim().slice(0, 40),
+    isSelected: Boolean(entry.isSelected),
+    priorityLabel,
+    ttlHours: safeTtl,
+    expiresAtEpochMs,
+    searchCategory: (entry.searchCategory || '').trim().slice(0, 120),
+    searchDistrict: (entry.searchDistrict || '').trim().slice(0, 120),
+    provenanceConfirmed,
+    independentBusinessName: provenanceConfirmed
+      ? (ind.independentBusinessName || '').trim().slice(0, 160)
+      : '',
+    independentPhone: provenanceConfirmed
+      ? (ind.independentPhone || '').trim().slice(0, 40)
+      : '',
+    independentAddress: provenanceConfirmed
+      ? (ind.independentAddress || '').trim().slice(0, 200)
+      : '',
+    district: (ind.district || '').trim().slice(0, 120),
+    independentWebsite: provenanceConfirmed
+      ? (ind.independentWebsite || '').trim().slice(0, 300)
+      : '',
+    independentEmail: provenanceConfirmed
+      ? (ind.independentEmail || '').trim().slice(0, 160)
+      : '',
+    independentCategory: (ind.independentCategory || '').trim().slice(0, 120),
+    confirmedNoWebsite: Boolean(ind.confirmedNoWebsite),
+    legalBasis: (ind.legalBasis || '').trim().slice(0, 300),
+    independentDataProvenance: effectiveProvenance,
+    promotedToCrmId: (entry.promotedToCrmId || '').trim().slice(0, 160),
+    createdAt: ts,
+    updatedAt: ts,
+  };
+}
+
+function mapTemporaryWorkSnapshotDoc(
+  d: QueryDocumentSnapshot<DocumentData> | DocumentSnapshot<DocumentData>,
+  uid: string
+): PersistedTemporaryWorkItem {
+  const data = d.data() || {};
+  const outcome: TemporaryQueueOutcome = ALLOWED_TEMPORARY_OUTCOMES.has(data.outcome)
+    ? data.outcome
+    : 'pendiente';
+  const priorityLabel: TemporaryQueuePriority = ALLOWED_TEMPORARY_PRIORITIES.has(data.priorityLabel)
+    ? data.priorityLabel
+    : 'normal';
+  const ttlHours: TemporaryQueueTtlHours = data.ttlHours === 12 ? 12 : 24;
+
+  return {
+    id: d.id,
+    ownerUid: String(data.ownerUid || uid),
+    placeId: String(data.placeId || d.id),
+    outcome,
+    notes: String(data.notes || ''),
+    followUpDate: String(data.followUpDate || ''),
+    isSelected: Boolean(data.isSelected),
+    priorityLabel,
+    ttlHours,
+    expiresAtEpochMs: Number(data.expiresAtEpochMs || 0),
+    searchCategory: String(data.searchCategory || ''),
+    searchDistrict: String(data.searchDistrict || ''),
+    provenanceConfirmed: Boolean(data.provenanceConfirmed),
+    independentBusinessName: String(data.independentBusinessName || ''),
+    independentPhone: String(data.independentPhone || ''),
+    independentAddress: String(data.independentAddress || ''),
+    district: String(data.district || ''),
+    independentWebsite: String(data.independentWebsite || ''),
+    independentEmail: String(data.independentEmail || ''),
+    independentCategory: String(data.independentCategory || ''),
+    confirmedNoWebsite: Boolean(data.confirmedNoWebsite),
+    legalBasis: String(data.legalBasis || ''),
+    independentDataProvenance: String(data.independentDataProvenance || ''),
+    promotedToCrmId: String(data.promotedToCrmId || ''),
+    createdAt: toIsoString(data.createdAt),
+    updatedAt: toIsoString(data.updatedAt),
+  };
+}
+
+/**
+ * Sincroniza de forma idempotente (sin duplicados y sin tocar CRM definitivo) elementos permitidos
+ * de la cola temporal hacia /users/{uid}/temporary_work_queue.
+ */
+export async function upsertTemporaryWorkItemsBatch(
+  uid: string,
+  entries: TemporaryQueueEntry[],
+  ttlHours: TemporaryQueueTtlHours = 24
+): Promise<number> {
+  if (!uid || entries.length === 0) return 0;
+  const collectionPath = getTemporaryWorkQueueCollectionPath(uid);
+  let synced = 0;
+
+  for (const entry of entries) {
+    const cleanId = sanitizeFirestoreId(entry.placeId);
+    if (!cleanId) continue;
+    const docPath = `${collectionPath}/${cleanId}`;
+    const ref = doc(db, docPath);
+    const fullPayload = buildTemporaryWorkItemPayload(uid, entry, ttlHours);
+
+    try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists()) {
+          tx.set(ref, fullPayload);
+        } else {
+          const { ownerUid: _o, placeId: _p, createdAt: _c, ...updateFields } = fullPayload;
+          tx.update(ref, updateFields);
+        }
+      });
+      synced += 1;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, docPath);
+    }
+  }
+
+  return synced;
+}
+
+/**
+ * Recupera los ítems vigentes (< 12h o < 24h) de la cola temporal desde Firestore al volver a iniciar
+ * o recargar la vista previa, devolviendo también los IDs expirados. 0 llamadas a Google Places.
+ */
+export async function fetchActiveTemporaryWorkQueue(
+  uid: string,
+  nowMs: number = Date.now()
+): Promise<{
+  activeItems: PersistedTemporaryWorkItem[];
+  expiredPlaceIds: string[];
+}> {
+  const path = getTemporaryWorkQueueCollectionPath(uid);
+  try {
+    const q = query(collection(db, path), where('ownerUid', '==', uid));
+    const snapshot = await getDocsFromServer(q);
+    const activeItems: PersistedTemporaryWorkItem[] = [];
+    const expiredPlaceIds: string[] = [];
+
+    for (const d of snapshot.docs) {
+      const mapped = mapTemporaryWorkSnapshotDoc(d, uid);
+      if (mapped.expiresAtEpochMs > nowMs) {
+        activeItems.push(mapped);
+      } else {
+        expiredPlaceIds.push(d.id);
+      }
+    }
+
+    activeItems.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return { activeItems, expiredPlaceIds };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, path);
+  }
+}
+
+/**
+ * Elimina elementos seleccionados o caducados exclusivamente en /users/{uid}/temporary_work_queue.
+ * Jamás modifica followups ni sandbox_followups.
+ */
+export async function deleteTemporaryWorkItemsBatch(
+  uid: string,
+  placeIds: string[]
+): Promise<number> {
+  if (!uid || placeIds.length === 0) return 0;
+  const collectionPath = getTemporaryWorkQueueCollectionPath(uid);
+  const uniqueIds = Array.from(
+    new Set(placeIds.map((id) => sanitizeFirestoreId(id)).filter(Boolean))
+  );
+  if (uniqueIds.length === 0) return 0;
+
+  let deleted = 0;
+  const CHUNK_SIZE = 400;
+  for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
+    const chunk = uniqueIds.slice(i, i + CHUNK_SIZE);
+    const batch = writeBatch(db);
+    for (const id of chunk) {
+      batch.delete(doc(db, collectionPath, id));
+    }
+    try {
+      await batch.commit();
+      deleted += chunk.length;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, collectionPath);
+    }
+  }
+  return deleted;
+}
+
+

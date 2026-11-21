@@ -7,6 +7,7 @@
 4. **Contact Authorization & Legal Basis Gate**: Moving a lead into or past `CONTACTO AUTORIZADO` (`CONTACTO AUTORIZADO`, `CONTACTADO`, `RESPONDIÓ`, `INTERESADO`, `COTIZACIÓN`, `CLIENTE`) requires a verifiable `legalBasis` string (`>= 8` characters). Automatic preselection (`PRESELECCIONADO`) never grants outreach authorization.
 5. **Immutable Ownership & Creation Timestamps**: `ownerUid`, `placeId`, `sourceKind`, and `createdAt` cannot be modified after document creation, and server `request.time` is enforced on all timestamps.
 6. **Strict Field Allowlists (No Shadow Fields)**: Every `create` checks `hasAll` and `hasOnly`; every `update` checks `affectedKeys().hasOnly(...)` inside the validation helper envelope. Terminal `'CLIENTE'` stage locks all fields except `notes` and `updatedAt`.
+7. **24h/12h Temporary Work Queue Isolation & Provenance Lock**: `/users/{userId}/temporary_work_queue/{itemId}` accepts only `ttlHours in [12, 24]`, proprietary fields (`notes`, `outcome`, `followUpDate`, `isSelected`, `priorityLabel`), `placeId`, and strictly rejects storing `independentBusinessName`, `independentPhone`, `independentAddress`, `independentWebsite`, or `independentEmail` unless `provenanceConfirmed == true` with valid `independentDataProvenance`.
 
 ## 2. Dirty Dozen Adversarial Payloads (Must Return PERMISSION_DENIED)
 1. Unauthenticated read/list on `/users/uidA/exclusions`.

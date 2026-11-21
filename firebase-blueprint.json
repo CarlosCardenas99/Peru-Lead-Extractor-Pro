@@ -259,6 +259,151 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "TemporaryWorkQueueItem": {
+      "title": "TemporaryWorkQueueItem",
+      "description": "Elemento temporal de seguimiento con TTL lógico de 12 o 24 horas. Almacena exclusivamente Place ID, notas propias, resultados, fechas, selecciones/prioridades y datos comerciales independientes autorizados (nunca campos restringidos de Google Maps).",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "placeId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "pendiente",
+            "contacto_no_autorizado",
+            "numero_incorrecto",
+            "no_responde",
+            "contacto_alcanzado",
+            "no_interesado",
+            "interesado",
+            "cotizacion",
+            "cliente",
+            "descartado"
+          ]
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "followUpDate": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "isSelected": {
+          "type": "boolean"
+        },
+        "priorityLabel": {
+          "type": "string",
+          "enum": ["alta", "normal", "baja"]
+        },
+        "ttlHours": {
+          "type": "number",
+          "enum": [12, 24]
+        },
+        "expiresAtEpochMs": {
+          "type": "number"
+        },
+        "searchCategory": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "searchDistrict": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "provenanceConfirmed": {
+          "type": "boolean"
+        },
+        "independentBusinessName": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "independentPhone": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "independentAddress": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "district": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "independentWebsite": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "independentEmail": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "independentCategory": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "confirmedNoWebsite": {
+          "type": "boolean"
+        },
+        "legalBasis": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "independentDataProvenance": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "promotedToCrmId": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "placeId",
+        "outcome",
+        "notes",
+        "followUpDate",
+        "isSelected",
+        "priorityLabel",
+        "ttlHours",
+        "expiresAtEpochMs",
+        "searchCategory",
+        "searchDistrict",
+        "provenanceConfirmed",
+        "independentBusinessName",
+        "independentPhone",
+        "independentAddress",
+        "district",
+        "independentWebsite",
+        "independentEmail",
+        "independentCategory",
+        "confirmedNoWebsite",
+        "legalBasis",
+        "independentDataProvenance",
+        "promotedToCrmId",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -277,6 +422,10 @@
     "/users/{userId}/sandbox_followups/{followupId}": {
       "schema": { "$ref": "#/entities/FollowupLeadRecord" },
       "description": "Espacio aislado de pruebas (FASE 7) bajo idénticas garantías de cumplimiento y seguridad sin tocar los 52 registros de producción."
+    },
+    "/users/{userId}/temporary_work_queue/{itemId}": {
+      "schema": { "$ref": "#/entities/TemporaryWorkQueueItem" },
+      "description": "Cola temporal recuperable con TTL configurable de 12 o 24 horas (Place ID, notas, resultados, fechas, selecciones/prioridades y datos comerciales independientes autorizados; nunca campos de Google Maps)."
     }
   }
 }

@@ -25,10 +25,18 @@ const SOCIAL_DOMAINS = [
   'google.com',
 ];
 
-const PERU_DISTRICTS = [
-  'Los Olivos',
+export const PERU_DISTRICTS = [
+  'San Juan de Lurigancho',
+  'San Juan de Miraflores',
   'San Martín de Porres',
   'San Martin de Porres',
+  'Villa El Salvador',
+  'Villa María del Triunfo',
+  'Villa Maria del Triunfo',
+  'Magdalena del Mar',
+  'Santiago de Surco',
+  'Cercado de Lima',
+  'Los Olivos',
   'Independencia',
   'Comas',
   'Carabayllo',
@@ -37,14 +45,12 @@ const PERU_DISTRICTS = [
   'Santa Rosa',
   'Miraflores',
   'San Isidro',
-  'Santiago de Surco',
   'Surco',
   'San Borja',
   'La Molina',
   'Jesús María',
   'Jesus Maria',
   'Lince',
-  'Magdalena del Mar',
   'Magdalena',
   'Pueblo Libre',
   'San Miguel',
@@ -57,16 +63,15 @@ const PERU_DISTRICTS = [
   'San Luis',
   'Breña',
   'Rímac',
-  'Cercado de Lima',
-  'Lima',
-  'Callao',
+  'El Agustino',
+  'Lurigancho',
+  'Chaclacayo',
+  'Lurín',
+  'Pachacamac',
   'Bellavista',
   'La Perla',
   'Ventanilla',
-  'San Juan de Lurigancho',
-  'San Juan de Miraflores',
-  'Villa El Salvador',
-  'Villa María del Triunfo',
+  'Carmen de la Legua',
   'Arequipa',
   'Trujillo',
   'Chiclayo',
@@ -75,6 +80,8 @@ const PERU_DISTRICTS = [
   'Huancayo',
   'Ica',
   'Tacna',
+  'Callao',
+  'Lima',
 ];
 
 function isSocialOrGoogleHost(hostname: string): boolean {
@@ -82,7 +89,7 @@ function isSocialOrGoogleHost(hostname: string): boolean {
   return SOCIAL_DOMAINS.some((d) => h === d || h.endsWith(`.${d}`));
 }
 
-function decodeHtmlEntities(text: string): string {
+export function decodeHtmlEntities(text: string): string {
   return text
     .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
@@ -104,11 +111,13 @@ function decodeHtmlEntities(text: string): string {
     .replace(/&Ntilde;/gi, 'Ñ');
 }
 
-function stripTags(html: string): string {
+export function stripTags(html: string): string {
   return decodeHtmlEntities(
     html
+      .replace(/<!--[\s\S]*?-->/g, ' ')
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
       .replace(/<[^>]+>/g, ' ')
       .replace(/\s+/g, ' ')
   ).trim();
@@ -125,7 +134,7 @@ function cleanBusinessTitle(rawTitle: string): string {
   return cleaned.slice(0, 160);
 }
 
-function extractFirstValidEmail(html: string): string | null {
+export function extractFirstValidEmail(html: string): string | null {
   const mailtoMatches = Array.from(html.matchAll(/href=["']mailto:([^"'?#\s]+)["']/gi)).map((m) =>
     m[1].trim()
   );
@@ -153,41 +162,120 @@ function extractFirstValidEmail(html: string): string | null {
   return null;
 }
 
-function extractFirstPeruvianPhone(
-  html: string
-): { formatted: string; lineType: PhoneLineType } | null {
+function isLikelyDummyPhone(e164: string): boolean {
+  const digits = e164.replace(/\D/g, '');
+  const local = digits.startsWith('51') ? digits.slice(2) : digits;
+  if (!local) return true;
+  if (/^(\d)\1+$/.test(local)) return true; // 999999999, 000000000
+  if (local === '123456789' || local === '012345678') return true;
+  if (/^(\d\d)\1{3,}\d?$/.test(local)) return true; // e.g. 979797979
+  return false;
+}
+
+export interface ExtractedPeruvianPhoneItem {
+  formatted: string;
+  e164: string;
+  lineType: PhoneLineType;
+}
+
+export function extractPeruvianPhonesFromHtml(html: string): ExtractedPeruvianPhoneItem[] {
   const telMatches = Array.from(html.matchAll(/href=["']tel:([^"']+)["']/gi)).map((m) =>
     decodeURIComponent(m[1]).trim()
   );
+  const waShortMatches = Array.from(
+    html.matchAll(/https?:\/\/(?:wa\.me|api\.whatsapp\.com\/send\?[^"'\s]*?phone=)\/?(\+?51\d{9}|\d{9})/gi)
+  ).map((m) => m[1].trim());
   const textMatches = Array.from(
-    stripTags(html).matchAll(/(?:\+?51[\s\-]*)?(?:\(0?\d{1,2}\)[\s\-]*)?(?:9\d{2}[\s\-]*\d{3}[\s\-]*\d{3}|\d{6,9})/g)
+    stripTags(html).matchAll(
+      /(?:\+?51[\s\-]*)?(?:\(0?\d{1,2}\)[\s\-]*)?(?:9\d{2}[\s\-]*\d{3}[\s\-]*\d{3}|\b0?\d{2}[\s\-]*\d{6,7}\b)/g
+    )
   ).map((m) => m[0].trim());
 
-  const validLandlines: Array<{ formatted: string; lineType: PhoneLineType }> = [];
+  const mobiles: ExtractedPeruvianPhoneItem[] = [];
+  const landlines: ExtractedPeruvianPhoneItem[] = [];
+  const seenE164 = new Set<string>();
 
-  for (const candidate of [...telMatches, ...textMatches]) {
+  for (const candidate of [...telMatches, ...waShortMatches, ...textMatches]) {
     const parsed = analyzePeruvianPhone(candidate);
-    if (!parsed.isValidFormat) continue;
+    if (!parsed.isValidFormat || !parsed.e164 || !parsed.formatted) continue;
+    if (isLikelyDummyPhone(parsed.e164)) continue;
+    if (seenE164.has(parsed.e164)) continue;
+    seenE164.add(parsed.e164);
+
+    const item: ExtractedPeruvianPhoneItem = {
+      formatted: parsed.formatted,
+      e164: parsed.e164,
+      lineType: parsed.lineType,
+    };
     if (parsed.lineType === 'mobile') {
-      return { formatted: parsed.formatted, lineType: parsed.lineType };
+      mobiles.push(item);
+    } else {
+      landlines.push(item);
     }
-    validLandlines.push({ formatted: parsed.formatted, lineType: parsed.lineType });
   }
 
-  return validLandlines[0] || null;
+  return [...mobiles, ...landlines];
 }
 
-function detectDistrictInText(text: string): string | null {
-  const lower = text.toLowerCase();
+function extractFirstPeruvianPhone(
+  html: string
+): { formatted: string; lineType: PhoneLineType } | null {
+  const all = extractPeruvianPhonesFromHtml(html);
+  return all[0] ? { formatted: all[0].formatted, lineType: all[0].lineType } : null;
+}
+
+export function extractSocialLinksFromHtml(html: string): string[] {
+  const rawLinks = Array.from(
+    html.matchAll(/href=["'](https?:\/\/(?:www\.|m\.|web\.)?(?:facebook|fb|instagram)\.com\/[^"'#\s]+)["']/gi)
+  ).map((m) => decodeHtmlEntities(m[1].trim()));
+
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const link of rawLinks) {
+    try {
+      const u = new URL(link);
+      const pathLower = u.pathname.toLowerCase();
+      if (
+        !pathLower ||
+        pathLower === '/' ||
+        /\/(sharer|share|plugins|tr|login|accounts|policies|privacy|help|reel|p)\b/.test(pathLower) ||
+        pathLower.endsWith('.php')
+      ) {
+        continue;
+      }
+      u.search = '';
+      const clean = u.toString().replace(/\/+$/, '');
+      if (!seen.has(clean.toLowerCase())) {
+        seen.add(clean.toLowerCase());
+        unique.push(clean);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return unique.slice(0, 4);
+}
+
+export function detectDistrictInText(text: string): string | null {
+  const normalizedText = text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
   for (const district of PERU_DISTRICTS) {
-    if (lower.includes(district.toLowerCase())) {
+    const normalizedDistrict = district
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    const escaped = normalizedDistrict.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(?:^|[^a-z0-9])${escaped}(?:$|[^a-z0-9])`);
+    if (regex.test(normalizedText)) {
       return district;
     }
   }
   return null;
 }
 
-function extractStreetAddressFromText(text: string): string | null {
+export function extractStreetAddressFromText(text: string): string | null {
   const match = text.match(
     /\b(?:Av\.?|Avenida|Jr\.?|Jirón|Jiron|Calle|Ca\.?|Pasaje|Psj\.?|Mz\.?|Manzana|Urb\.?|Urbanización)\s+[A-Za-zÁÉÍÓÚÑáéíóúñ0-9°º.,\-\s]{6,110}/i
   );
@@ -554,6 +642,11 @@ async function fetchHtmlSafely(
  * y contexto propio de búsqueda/notas del usuario). NUNCA consulta Google Places API ni copia
  * campos restringidos de Google Maps.
  */
+export interface CorroborationDetailedResult extends IndependentCorroborationResult {
+  allFoundPhones: Array<ExtractedPeruvianPhoneItem & { evidenceUrl: string }>;
+  discoveredSocialLinks: string[];
+}
+
 export async function corroborateLeadIndependently(
   input: {
     placeId: string;
@@ -566,7 +659,7 @@ export async function corroborateLeadIndependently(
     fetchFn?: typeof fetch;
     dnsLookupFn?: DnsLookupFn;
   }
-): Promise<IndependentCorroborationResult> {
+): Promise<CorroborationDetailedResult> {
   const verifiedAt = new Date().toISOString();
   const fetchFn = deps?.fetchFn || fetch;
   const candidateUrl =
@@ -585,6 +678,25 @@ export async function corroborateLeadIndependently(
     category: null,
   };
   const checkedUrls: string[] = [];
+  const allFoundPhones: Array<ExtractedPeruvianPhoneItem & { evidenceUrl: string }> = [];
+  const seenPhoneE164 = new Set<string>();
+  const discoveredSocialLinks: string[] = [];
+  const seenSocial = new Set<string>();
+
+  const appendPhones = (html: string, evidenceUrl: string) => {
+    for (const item of extractPeruvianPhonesFromHtml(html)) {
+      if (seenPhoneE164.has(item.e164)) continue;
+      seenPhoneE164.add(item.e164);
+      allFoundPhones.push({ ...item, evidenceUrl });
+    }
+    for (const s of extractSocialLinksFromHtml(html)) {
+      if (!seenSocial.has(s.toLowerCase())) {
+        seenSocial.add(s.toLowerCase());
+        discoveredSocialLinks.push(s);
+      }
+    }
+  };
+
   let websiteStatus: WebsiteVerificationStatus = 'unregistered';
   let summary = 'Sin sitio web oficial propio para corroboración automática; requiere captura legítima del usuario.';
 
@@ -595,6 +707,19 @@ export async function corroborateLeadIndependently(
       websiteStatus = homeFetch.url.startsWith('https://') ? 'active_https' : 'active_http';
       const homeSignals = extractIndependentSignalsFromHtml(homeFetch.html, homeFetch.url, verifiedAt);
       Object.assign(candidates, homeSignals);
+      appendPhones(homeFetch.html, homeFetch.url);
+      if (homeSignals.phone?.value) {
+        const p = analyzePeruvianPhone(homeSignals.phone.value);
+        if (p.isValidFormat && p.e164 && !seenPhoneE164.has(p.e164)) {
+          seenPhoneE164.add(p.e164);
+          allFoundPhones.unshift({
+            formatted: p.formatted || homeSignals.phone.value,
+            e164: p.e164,
+            lineType: p.lineType,
+            evidenceUrl: homeFetch.url,
+          });
+        }
+      }
 
       // Si faltan teléfono, correo o dirección, intentar 1 página de contacto del mismo origen
       if (!candidates.phone || !candidates.email || !candidates.address) {
@@ -608,6 +733,7 @@ export async function corroborateLeadIndependently(
               contactFetch.url,
               verifiedAt
             );
+            appendPhones(contactFetch.html, contactFetch.url);
             candidates.businessName = candidates.businessName || contactSignals.businessName;
             candidates.phone = candidates.phone || contactSignals.phone;
             candidates.phoneType = candidates.phoneType || contactSignals.phoneType;
@@ -673,5 +799,7 @@ export async function corroborateLeadIndependently(
     completeness,
     summary,
     candidates,
+    allFoundPhones,
+    discoveredSocialLinks,
   };
 }

@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { AddressInfo } from 'node:net';
+import ExcelJS from 'exceljs';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
@@ -42,6 +43,11 @@ import {
   corroborateLeadIndependently,
   extractIndependentSignalsFromHtml,
 } from '../server/independentCorroborator';
+import {
+  parseDatosPeruCompanyHtml,
+  passesDatosPeruIdentityGate,
+  researchMissingLeadData,
+} from '../server/missingDataResearcher';
 import { parseSubzoneGeminiResponse } from '../server/geminiSubzoneService';
 import { createApiApp } from '../server';
 import { buildBusinessLeadFromPlace } from '../services/geminiService';
@@ -49,20 +55,44 @@ import {
   buildFollowupCreateDocPayload,
   buildMissingFieldsPatch,
   buildSafeLegacyCleanupPreview,
+  buildTemporaryWorkItemPayload,
   clampFirestoreScore,
+  deleteFollowupsBatchWithProgress,
   formatFriendlyFirestoreError,
   getFollowupsCollectionPath,
+  getTemporaryWorkQueueCollectionPath,
   planNonDestructiveFollowupBatch,
 } from '../services/firebaseService';
 import { FollowupCrmView } from '../components/FollowupCrmView';
+import { TemporaryQueueView } from '../components/TemporaryQueueView';
 import { ExportButton } from '../components/ExportButton';
 import { buildNonDestructiveRecoveryPreviews } from '../components/FollowupRecoveryModal';
+import {
+  addLeadsToTemporaryQueue,
+  applyTtlToTemporaryQueue,
+  clearTemporaryQueue,
+  computeExpiryIso,
+  evaluateTemporaryEntryFourConcepts,
+  filterTemporaryQueue,
+  hasUnrecoverableSessionMapsWork,
+  mapTemporaryOutcomeToCrmState,
+  mergeRestoredTemporaryQueue,
+  reattachSessionLeadsToTemporaryQueue,
+  removeFromTemporaryQueue,
+  updateTemporaryQueueEntry,
+} from '../utils/temporaryQueue';
+import {
+  exportTemporaryQueueToExcel,
+  generateTemporaryQueueExcelWorkbookBuffer,
+} from '../utils/temporaryQueueExcelExport';
 import {
   buildPersistedVerificationReport,
   encodeOutcomeHistoryEntry,
   encodeVerificationProvenanceEntry,
   evaluateFollowupCompleteness,
+  evaluateFourStagePipelineStatus,
   getCommercialOutcomeLabel,
+  getFieldClassificationMeta,
   isIndependentEntryDistinctFromRawMapsGuard,
   mergeOutcomeHistory,
   mergeVerificationSources,
@@ -84,9 +114,12 @@ import {
   ExclusionRecord,
   FollowupLeadRecord,
   GooglePlaceRaw,
+  PersistedTemporaryWorkItem,
   PlaceHydrationEntry,
   PlacesQuotaBlockState,
   QuotaStatus,
+  TEMPORARY_QUEUE_OUTCOMES,
+  TemporaryQueueEntry,
 } from '../types';
 
 describe('1. Deduplicación por Place ID y sucursales', () => {
@@ -2329,6 +2362,1380 @@ describe('11. Persistencia fiel de fichas, URLs manuales, reportes de servidor y
     expect((fullPayload.verificationSources as string[]).length).toBe(3);
   });
 });
+
+describe('12. Módulo Investigar datos faltantes (0 Places): Casos A, B, C, D, Identity Gate y Endpoint HTTP', () => {
+  const publicDnsLookup = (async () => [{ address: '93.184.216.34', family: 4 }]) as any;
+
+  it('Caso A: negocio con web oficial multi-sede corrobora teléfono coincidente con Maps y clasifica 4 estados con 0 llamadas Places', async () => {
+    const htmlGavet = `
+      <!doctype html>
+      <html>
+        <head>
+          <title>Clínica Veterinaria Gavet</title>
+          <script type="application/ld+json">
+            {
+              "@context": "https://schema.org",
+              "@type": "VeterinaryCare",
+              "name": "Clínica Veterinaria Gavet",
+              "telephone": "+51 960 814 125",
+              "email": "hola@veterinariagavetperu.com",
+              "address": {
+                "@type": "PostalAddress",
+                "streetAddress": "Av. Las Palmeras 3900",
+                "addressLocality": "Los Olivos"
+              }
+            }
+          </script>
+        </head>
+        <body>
+          <h1>Clínica Veterinaria Gavet</h1>
+          <p>Sede Los Olivos: Av. Las Palmeras 3900, Los Olivos.</p>
+          <a href="https://wa.me/51993580357">WhatsApp Los Olivos</a>
+          <a href="https://wa.me/51960814125">WhatsApp San Martín</a>
+        </body>
+      </html>
+    `;
+
+    const fakeFetch = (async (url: string) => {
+      if (String(url).includes('veterinariagavetperu.com')) {
+        return new Response(htmlGavet, {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+        });
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    const result = await researchMissingLeadData(
+      {
+        placeId: 'ChIJ_GAVET_A',
+        officialWebsiteUrl: 'https://veterinariagavetperu.com',
+        searchCategory: 'Veterinarias',
+        searchDistrict: 'Los Olivos',
+        sessionMapsRef: {
+          name: 'Clínica Veterinaria Gavet - Los Olivos',
+          address: 'Av. Las Palmeras 3900, Los Olivos',
+          phone: '+51 993 580 357',
+          district: 'Los Olivos',
+          website: 'https://veterinariagavetperu.com',
+        },
+      },
+      { fetchFn: fakeFetch, dnsLookupFn: publicDnsLookup }
+    );
+
+    expect(result.hasContradictions).toBe(false);
+    expect(result.canPersistCompleteCard).toBe(true);
+    expect(result.recommendedQueue).toBe('complete_ready');
+    expect(result.fieldClassifications.businessName.status).toBe('corroborated_persistable');
+    expect(result.fieldClassifications.phone.status).toBe('corroborated_persistable');
+    expect(result.fieldClassifications.address.status).toBe('corroborated_persistable');
+    expect(result.fieldClassifications.website.status).toBe('corroborated_persistable');
+    expect(result.fieldClassifications.email.status).toBe('corroborated_persistable');
+    expect(result.corroboration.candidates.phone?.value).toBe('+51 993 580 357');
+    expect(result.corroboration.candidates.email?.value).toBe('hola@veterinariagavetperu.com');
+  });
+
+  it('Caso B + Identity Gate + Privacidad: negocio sin web corrobora DatosPeru + evidencia autorizada, rechaza homónimo textil y jamás extrae DNIs', async () => {
+    const htmlTextileMismatch = `
+      <html><head><title>TEXTILES CONSENTIDOS S.A.C.</title></head><body>
+        <h1>TEXTILES CONSENTIDOS S.A.C.</h1>
+        <div>RUC: 20511223344</div>
+        <div>Estado: ACTIVO</div>
+        <div>Condición: HABIDO</div>
+        <div>Dirección: JR. GAMARRA 450, LA VICTORIA, LIMA</div>
+        <div>CIIU: 1410 - FABRICACION DE PRENDAS DE VESTIR</div>
+        <div>Representante Legal: JUAN PEREZ DNI 40112233</div>
+      </body></html>
+    `;
+    const parsedMismatch = parseDatosPeruCompanyHtml(
+      htmlTextileMismatch,
+      'https://www.datosperu.org/empresa-textiles-consentidos.php'
+    );
+    expect(parsedMismatch).not.toBeNull();
+    expect(JSON.stringify(parsedMismatch)).not.toContain('40112233');
+    expect(JSON.stringify(parsedMismatch)).not.toContain('JUAN PEREZ');
+    expect(
+      passesDatosPeruIdentityGate(parsedMismatch!, {
+        businessName: 'Veterinaria Consentidos',
+        district: 'Los Olivos',
+        category: 'Veterinarias',
+      }).accepted
+    ).toBe(false);
+
+    const htmlDatosPeruSearch = `
+      <html><body>
+        <a href="empresa-textiles-consentidos-20511223344.php">TEXTILES CONSENTIDOS S.A.C.</a>
+        <a href="empresa-veterinaria-consentidos-20609988771.php">VETERINARIA CONSENTIDOS S.A.C.</a>
+      </body></html>
+    `;
+    const htmlVetDetail = `
+      <html><head><title>VETERINARIA CONSENTIDOS S.A.C.</title></head><body>
+        <h1>VETERINARIA CONSENTIDOS S.A.C.</h1>
+        <div>RUC: 20609988771</div>
+        <div>Estado: ACTIVO</div>
+        <div>Condición: HABIDO</div>
+        <div>Dirección: AV. NARANJAL 1420, LOS OLIVOS, LIMA</div>
+        <div>CIIU: 7500 - ACTIVIDADES VETERINARIAS</div>
+        <div>Gerente General: MARIA LOPEZ DNI 41998877</div>
+      </body></html>
+    `;
+
+    const fakeFetch = (async (url: string) => {
+      const s = String(url);
+      if (s.includes('facebook.com')) {
+        return new Response('', {
+          status: 302,
+          headers: { location: 'https://www.facebook.com/login/?next=consentidos' },
+        });
+      }
+      if (s.includes('buscador_empresas.php')) {
+        return new Response(htmlDatosPeruSearch, { status: 200 });
+      }
+      if (s.includes('empresa-textiles-consentidos')) {
+        return new Response(htmlTextileMismatch, { status: 200 });
+      }
+      if (s.includes('empresa-veterinaria-consentidos')) {
+        return new Response(htmlVetDetail, { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    const resB = await researchMissingLeadData(
+      {
+        placeId: 'ChIJ_CONSENTIDOS_B',
+        officialWebsiteUrl: '',
+        socialOrDirectoryUrl: 'https://www.facebook.com/VeterinariaConsentidos/',
+        userProvidedEvidenceText:
+          'Tarjeta verificada de atención: WhatsApp +51 987 654 321 · Correo: citas@consentidosvet.pe',
+        searchCategory: 'Veterinarias',
+        searchDistrict: 'Los Olivos',
+        sessionMapsRef: {
+          name: 'Veterinaria Consentidos',
+          address: 'Av. Naranjal 1420, Los Olivos',
+          phone: '+51 987 654 321',
+          district: 'Los Olivos',
+          website: '',
+        },
+      },
+      { fetchFn: fakeFetch, dnsLookupFn: publicDnsLookup }
+    );
+
+    const metaAttempt = resB.sourceAttempts.find((a) => a.sourceId === 'meta_social');
+    expect(metaAttempt?.status).toBe('blocked_or_restricted');
+    expect(metaAttempt?.detail).toContain('login wall');
+
+    const datosPeruAttempt = resB.sourceAttempts.find((a) => a.sourceId === 'datosperu_ruc');
+    expect(datosPeruAttempt?.status).toBe('found');
+    expect(resB.hasContradictions).toBe(false);
+    expect(resB.fieldClassifications.businessName.status).toBe('corroborated_persistable');
+    expect(resB.fieldClassifications.businessName.independentValue).toBe('VETERINARIA CONSENTIDOS S.A.C.');
+    expect(resB.fieldClassifications.address.status).toBe('corroborated_persistable');
+    expect(resB.fieldClassifications.phone.status).toBe('corroborated_persistable');
+    expect(resB.fieldClassifications.phone.independentValue).toBe('+51 987 654 321');
+    expect(resB.fieldClassifications.email.independentValue).toBe('citas@consentidosvet.pe');
+  });
+
+  it('Caso C: sin fuentes independientes disponibles mantiene candidato en research_queue y NUNCA copia campos de sesión Maps', async () => {
+    const fakeFetch = (async (url: string) => {
+      if (String(url).includes('instagram.com')) {
+        return new Response('', {
+          status: 302,
+          headers: { location: 'https://www.instagram.com/accounts/login/' },
+        });
+      }
+      return new Response('<html><body>Sin resultados</body></html>', { status: 200 });
+    }) as typeof fetch;
+
+    const resC = await researchMissingLeadData(
+      {
+        placeId: 'ChIJ_CONSENTIDOS_C',
+        officialWebsiteUrl: '',
+        socialOrDirectoryUrl: 'https://www.instagram.com/consentidosvet/',
+        searchCategory: 'Veterinarias',
+        searchDistrict: 'Los Olivos',
+        sessionMapsRef: {
+          name: 'Veterinaria Consentidos – Los Olivos',
+          address: 'Av. Naranjal 1420, Los Olivos',
+          phone: '+51 987 654 321',
+          district: 'Los Olivos',
+          website: '',
+        },
+      },
+      { fetchFn: fakeFetch, dnsLookupFn: publicDnsLookup }
+    );
+
+    expect(resC.canPersistCompleteCard).toBe(false);
+    expect(resC.recommendedQueue).toBe('research_queue');
+    expect(resC.hasContradictions).toBe(false);
+    expect(resC.corroboration.candidates.businessName).toBeNull();
+    expect(resC.corroboration.candidates.phone).toBeNull();
+    expect(resC.corroboration.candidates.address).toBeNull();
+    expect(resC.fieldClassifications.businessName.status).toBe('maps_session_only');
+    expect(resC.fieldClassifications.phone.status).toBe('maps_session_only');
+    expect(resC.fieldClassifications.address.status).toBe('maps_session_only');
+    expect(resC.fieldClassifications.website.status).toBe('not_found');
+    expect(resC.missingPersistableFields.length).toBeGreaterThanOrEqual(4);
+    expect(resC.manualReviewLinks.length).toBeGreaterThanOrEqual(2);
+    expect(getFieldClassificationMeta('maps_session_only').label).toBe(
+      'Disponible solamente en sesión de Google Maps'
+    );
+  });
+
+  it('Caso D: teléfono contradictorio entre fuente independiente y Google Maps bloquea auto-relleno y fuerza research_queue', async () => {
+    const htmlMismatchPhone = `
+      <html><head><title>Veterinaria Alfa</title></head><body>
+        <h1>Veterinaria Alfa</h1>
+        <p>Av. Universitaria 3200, Los Olivos</p>
+        <a href="tel:+51911222333">Llamar 911 222 333</a>
+      </body></html>
+    `;
+    const fakeFetch = (async (url: string) => {
+      if (String(url).includes('veterinariaalfa.pe')) {
+        return new Response(htmlMismatchPhone, {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        });
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    const resD = await researchMissingLeadData(
+      {
+        placeId: 'ChIJ_CONTRADICTORY_D',
+        officialWebsiteUrl: 'https://veterinariaalfa.pe',
+        searchCategory: 'Veterinarias',
+        searchDistrict: 'Los Olivos',
+        sessionMapsRef: {
+          name: 'Veterinaria Alfa',
+          address: 'Av. Universitaria 3200, Los Olivos',
+          phone: '+51 999 888 777',
+          district: 'Los Olivos',
+          website: 'https://veterinariaalfa.pe',
+        },
+      },
+      { fetchFn: fakeFetch, dnsLookupFn: publicDnsLookup }
+    );
+
+    expect(resD.hasContradictions).toBe(true);
+    expect(resD.canPersistCompleteCard).toBe(false);
+    expect(resD.recommendedQueue).toBe('research_queue');
+    expect(resD.fieldClassifications.phone.status).toBe('contradictory');
+    expect(resD.corroboration.candidates.phone).toBeNull();
+    expect(resD.contradictionAlerts[0]).toMatch(/contradictorio/i);
+  });
+
+  it('Etapas del embudo (1-4) y endpoint POST /api/leads/research-missing garantizan 0 llamadas a Google Places', async () => {
+    const s1 = evaluateFourStagePipelineStatus({
+      placeId: 'ChIJ_stage1',
+      independentBusinessName: '',
+      independentPhone: '',
+      independentAddress: '',
+      district: 'Los Olivos',
+      independentWebsite: '',
+      confirmedNoWebsite: false,
+      independentEmail: '',
+      independentCategory: 'Veterinarias',
+      stage: 'PENDIENTE DE VERIFICACIÓN',
+      legalBasis: '',
+      phoneStage: 'none',
+    });
+    expect(s1.currentStageLabel).toBe('1. Candidato en Google Maps');
+
+    const s2 = evaluateFourStagePipelineStatus({
+      placeId: 'ChIJ_stage2',
+      independentBusinessName: 'Vet Real',
+      independentPhone: '+51 987 654 321',
+      independentAddress: 'Av. Perú 100',
+      district: 'Los Olivos',
+      independentWebsite: 'https://vetreal.pe',
+      confirmedNoWebsite: false,
+      independentEmail: '',
+      independentCategory: 'Veterinarias',
+      stage: 'PRESELECCIONADO',
+      legalBasis: '',
+      phoneStage: 'independently_corroborated',
+    });
+    expect(s2.currentStageLabel).toBe('2. Ficha comercial corroborada');
+
+    const s3 = evaluateFourStagePipelineStatus({
+      placeId: 'ChIJ_stage3',
+      independentBusinessName: 'Vet Real',
+      independentPhone: '+51 987 654 321',
+      independentAddress: 'Av. Perú 100',
+      district: 'Los Olivos',
+      independentWebsite: '',
+      confirmedNoWebsite: true,
+      independentEmail: '',
+      independentCategory: 'Veterinarias',
+      stage: 'CONTACTO AUTORIZADO',
+      legalBasis: 'Consentimiento escrito B2B',
+      phoneStage: 'independently_corroborated',
+    });
+    expect(s3.currentStageLabel).toBe('3. Contacto legalmente autorizado');
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response('<html><body>Sin datos</body></html>', { status: 404 })) as typeof fetch;
+
+    const guard = new DailyQuotaGuard({ placesLimit: 60, geminiLimit: 40 });
+    const app = createApiApp(guard);
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const resp = await origFetch(`http://127.0.0.1:${port}/api/leads/research-missing`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: [
+            {
+              placeId: 'ChIJ_http_0_places',
+              searchCategory: 'Veterinarias',
+              searchDistrict: 'Los Olivos',
+              userProvidedEvidenceText: 'Teléfono verificado +51 987 654 321 · Razón social: Vet Norte SAC',
+              sessionMapsRef: {
+                name: 'Vet Norte',
+                phone: '+51 987 654 321',
+                district: 'Los Olivos',
+              },
+            },
+          ],
+        }),
+      });
+      expect(resp.status).toBe(200);
+      const data: any = await resp.json();
+      expect(data.placesCallsConsumed).toBe(0);
+      expect(data.quota.placesUsed).toBe(0);
+      expect(data.results).toHaveLength(1);
+      expect(data.results[0].fieldClassifications.phone.independentValue).toBe('+51 987 654 321');
+    } finally {
+      server.close();
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('Caso Real Negativo (CETT CONSENTIDOS S.A.C. RUC 20610386009 vs Veterinaria Consentidos - Los Olivos): rechaza por rubro/CIIU y geografía, clasifica IDENTIDAD NO CONFIRMADA y nunca sustituye nombre', async () => {
+    const htmlRealCettConsentidos = `
+      <html>
+        <head><title>CETT CONSENTIDOS S.A.C - RUC 20610386009 | Datos Perú</title></head>
+        <body>
+          <h1>CETT CONSENTIDOS S.A.C</h1>
+          <div>RUC 20610386009</div>
+          <div>Estado Contribuyente ACTIVO</div>
+          <div>Condición Contribuyente HABIDO</div>
+          <div>Domicilio Fiscal AV. LAS FLORES DE PRIMAVERA NRO. 651 COO. LAS FLORES (PARADERO 4 DE LA AVENIDA LAS FLORES) SAN JUAN DE LURIGANCHO - LIMA - LIMA</div>
+          <div>REACTIVA PERÚ</div>
+          <div>Actividades Económicas
+            CIIU: 8690 Principal OTRAS ACTIVIDADES DE ATENCIÓN DE LA SALUD HUMANA
+            CIIU: 8550 Secundaria ACTIVIDADES DE APOYO A LA ENSEÑANZA
+            CIIU: 9609 Secundaria OTRAS ACTIVIDADES DE SERVICIOS PERSONALES N.C.P.
+          </div>
+          <div>ALGUNOS DE LOS PRINCIPALES EJECUTIVOS</div>
+        </body>
+      </html>
+    `;
+
+    const htmlAutomotiveHomonymSameDistrict = `
+      <html>
+        <head><title>CONSENTIDOS CAR E.I.R.L</title></head>
+        <body>
+          <h1>CONSENTIDOS CAR E.I.R.L</h1>
+          <div>RUC 20608694138</div>
+          <div>Estado Contribuyente ACTIVO</div>
+          <div>Domicilio Fiscal AV. UNIVERSITARIA 1800 LOS OLIVOS - LIMA</div>
+          <div>CIIU: 4520 Principal MANTENIMIENTO Y REPARACION DE VEHICULOS AUTOMOTORES</div>
+        </body>
+      </html>
+    `;
+
+    const parsedCett = parseDatosPeruCompanyHtml(
+      htmlRealCettConsentidos,
+      'https://www.datosperu.org/empresa-cett-consentidos-sac-20610386009.php'
+    );
+    expect(parsedCett).not.toBeNull();
+    expect(parsedCett!.district).toBe('San Juan de Lurigancho');
+    expect(parsedCett!.domicilioFiscal).toContain('SAN JUAN DE LURIGANCHO');
+    expect(parsedCett!.ciiuCodes).toEqual(['8690', '8550', '9609']);
+    expect(parsedCett!.principalCiiu).toContain('8690');
+
+    // Rechazo por contradicción determinante de rubro/CIIU (Salud Humana vs Veterinarias)
+    const gateByCategory = passesDatosPeruIdentityGate(parsedCett!, {
+      businessName: 'Veterinaria Consentidos - Los Olivos',
+      district: 'Los Olivos',
+      address: 'Taurija MZ A, Los Olivos',
+      category: 'Veterinarias',
+    });
+    expect(gateByCategory.accepted).toBe(false);
+    expect(gateByCategory.reason).toMatch(/rubro\/CIIU|8690/i);
+
+    // Incluso sin categoría, el filtro geográfico obligatorio rechaza San Juan de Lurigancho vs Los Olivos
+    const gateByGeoOnly = passesDatosPeruIdentityGate(parsedCett!, {
+      businessName: 'Veterinaria Consentidos - Los Olivos',
+      district: 'Los Olivos',
+      address: 'Taurija MZ A, Los Olivos',
+      category: '',
+    });
+    expect(gateByGeoOnly.accepted).toBe(false);
+    expect(gateByGeoOnly.reason).toMatch(/Contradicción geográfica/i);
+
+    // Homónimo en el MISMO distrito (Los Olivos) pero rubro automotriz también debe ser rechazado
+    const parsedCar = parseDatosPeruCompanyHtml(
+      htmlAutomotiveHomonymSameDistrict,
+      'https://www.datosperu.org/empresa-consentidos-car-eirl-20608694138.php'
+    );
+    const gateCar = passesDatosPeruIdentityGate(parsedCar!, {
+      businessName: 'Veterinaria Consentidos - Los Olivos',
+      district: 'Los Olivos',
+      category: 'Veterinarias',
+    });
+    expect(gateCar.accepted).toBe(false);
+
+    // E2E simulado completo incluyendo directorios 403 Cloudflare (TodosNegocios / Cybo)
+    const fakeFetch = (async (url: string) => {
+      const s = String(url);
+      if (s.includes('todosnegocios.com') || s.includes('cybo.com')) {
+        return new Response('<html><title>Just a moment...</title></html>', { status: 403 });
+      }
+      if (s.includes('buscador_empresas.php')) {
+        return new Response(
+          `
+            <a href="empresa-cett-consentidos-sac-20610386009.php">CETT CONSENTIDOS</a>
+            <a href="empresa-consentidos-car-eirl-20608694138.php">CONSENTIDOS CAR</a>
+          `,
+          { status: 200 }
+        );
+      }
+      if (s.includes('empresa-cett-consentidos')) {
+        return new Response(htmlRealCettConsentidos, { status: 200 });
+      }
+      if (s.includes('empresa-consentidos-car')) {
+        return new Response(htmlAutomotiveHomonymSameDistrict, { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    const result = await researchMissingLeadData(
+      {
+        placeId: 'ChIJ_real_consentidos',
+        officialWebsiteUrl: '',
+        socialOrDirectoryUrl: 'https://pe.todosnegocios.com/veterinaria-consentidos-los-olivos-990-144-207',
+        searchCategory: 'Veterinarias',
+        searchDistrict: 'Los Olivos',
+        sessionMapsRef: {
+          name: 'Veterinaria Consentidos - Los Olivos',
+          address: 'Taurija MZ A, Los Olivos',
+          phone: '+51 990 144 207',
+          district: 'Los Olivos',
+          website: '',
+        },
+      },
+      { fetchFn: fakeFetch, dnsLookupFn: publicDnsLookup }
+    );
+
+    expect(result.identityMatch.overallConfidence).toBe('unconfirmed');
+    expect(result.identityMatch.identityStatusLabel).toBe('IDENTIDAD NO CONFIRMADA');
+    expect(result.identityMatch.summary).toContain('IDENTIDAD NO CONFIRMADA');
+    expect(result.identityMatch.rejectionReasons?.length).toBeGreaterThanOrEqual(2);
+    expect(result.canPersistCompleteCard).toBe(false);
+    expect(result.recommendedQueue).toBe('research_queue');
+    // Jamás sustituir nombre ni copiar teléfono de Maps
+    expect(result.corroboration.candidates.businessName).toBeNull();
+    expect(result.corroboration.candidates.phone).toBeNull();
+    expect(result.fieldClassifications.businessName.status).toBe('maps_session_only');
+    expect(result.fieldClassifications.phone.status).toBe('maps_session_only');
+    // Directorio Cloudflare 403 reportado honestamente sin almacenamiento automático
+    const dirAttempt = result.sourceAttempts.find((a) => a.sourceId === 'directory_reference');
+    expect(dirAttempt?.status).toBe('blocked_or_restricted');
+    expect(dirAttempt?.httpStatus).toBe(403);
+    expect(dirAttempt?.retentionPermitted).toBe(false);
+  });
+
+  it('Acepta sucursal legítima solo cuando acredita CIIU compatible y Establecimiento Anexo en el distrito consultado', () => {
+    const htmlSucursalVet = `
+      <html>
+        <head><title>CLINICA VETERINARIA HUAYLAS S.A.C.</title></head>
+        <body>
+          <h1>CLINICA VETERINARIA HUAYLAS S.A.C.</h1>
+          <div>RUC 20601112223</div>
+          <div>Estado Contribuyente ACTIVO</div>
+          <div>Domicilio Fiscal AV. LARCO 450 MIRAFLORES - LIMA</div>
+          <div>Actividades Económicas CIIU: 7500 Principal ACTIVIDADES VETERINARIAS</div>
+          <div>ESTABLECIMIENTOS ANEXOS
+            AV. NARANJAL 500 LOS OLIVOS - LIMA
+          </div>
+        </body>
+      </html>
+    `;
+    const parsedBranch = parseDatosPeruCompanyHtml(
+      htmlSucursalVet,
+      'https://www.datosperu.org/empresa-vet-huaylas.php'
+    );
+    const gateBranch = passesDatosPeruIdentityGate(parsedBranch!, {
+      businessName: 'Veterinaria Huaylas',
+      district: 'Los Olivos',
+      category: 'Veterinarias',
+    });
+    expect(gateBranch.accepted).toBe(true);
+    expect(gateBranch.branchEvidenceInDistrict).toBe(true);
+    expect(gateBranch.matchedDistrictAddress).toContain('LOS OLIVOS');
+  });
+});
+
+describe('13. Rediseño Funcional: Cola Temporal de Sesión (Fases 1-2), Borrado Firestore Controlado (Fase 3), Resultados/CRM (Fase 4) y Preselección Determinística (Fase 5)', () => {
+  const emptyExcl = buildExclusionKeySet([]);
+
+  const buildSampleRawPlace = (idx: number, overrides: Partial<GooglePlaceRaw> = {}): GooglePlaceRaw => ({
+    placeId: `ChIJ_temp_${idx}`,
+    displayName: `Negocio Prueba ${idx}`,
+    formattedAddress: `Av. Palmeras ${100 + idx}, Los Olivos`,
+    location: { lat: -11.98, lng: -77.06 },
+    nationalPhoneNumber: `987 654 32${idx}`,
+    internationalPhoneNumber: `+51 987 654 32${idx}`,
+    websiteUri: idx % 2 === 0 ? null : `https://negocio${idx}.pe`,
+    googleMapsUri: `https://maps.google.com/?cid=${idx}`,
+    rating: 4.5,
+    userRatingCount: 20,
+    businessStatus: 'OPERATIONAL',
+    primaryTypeDisplayName: 'Veterinaria',
+    ...overrides,
+  });
+
+  it('FASE 1 & 2: agrega 5 prospectos con nombre y teléfono inmediatos (0 Places Details), deduplica por Place ID, filtra, edita y elimina sin perder estado', () => {
+    const leads5 = [1, 2, 3, 4, 5].map((i) =>
+      buildBusinessLeadFromPlace(buildSampleRawPlace(i), 'Veterinarias', emptyExcl)
+    );
+
+    const addRes1 = addLeadsToTemporaryQueue([], leads5, {
+      district: 'Los Olivos, Lima',
+      category: 'Veterinarias',
+    });
+
+    expect(addRes1.addedCount).toBe(5);
+    expect(addRes1.skippedDuplicates).toBe(0);
+    expect(addRes1.queue).toHaveLength(5);
+
+    // Todos muestran nombre y teléfono desde Explorador inmediatamente sin requerir 4/4 campos independientes
+    for (const entry of addRes1.queue) {
+      expect(entry.lead.name).toMatch(/^Negocio Prueba \d$/);
+      expect(entry.lead.phone).toMatch(/^\+51 987 654 32\d$/);
+      expect(entry.outcome).toBe('pendiente');
+      expect(entry.independentData.independentBusinessName).toBe('');
+    }
+
+    // Reintentar agregar duplicados no duplica Place IDs
+    const dupRes = addLeadsToTemporaryQueue(addRes1.queue, [leads5[0], leads5[2]]);
+    expect(dupRes.addedCount).toBe(0);
+    expect(dupRes.skippedDuplicates).toBe(2);
+    expect(dupRes.queue).toHaveLength(5);
+
+    // Edición de resultado comercial y nota propia WEBNEX
+    let queue = updateTemporaryQueueEntry(addRes1.queue, 'ChIJ_temp_2', {
+      outcome: 'interesado',
+      notes: 'Mostró interés en renovación web.',
+      independentData: {
+        independentBusinessName: 'Veterinaria Prueba 2 SAC',
+        independentPhone: '+51 987 654 322',
+        independentAddress: 'Av. Palmeras 102, Los Olivos',
+        district: 'Los Olivos',
+        confirmedNoWebsite: true,
+        legalBasis: 'Solicitud directa recibida vía formulario web',
+        provenanceConfirmed: true,
+      },
+    });
+    queue = updateTemporaryQueueEntry(queue, 'ChIJ_temp_4', {
+      outcome: 'no_responde',
+      notes: 'Sin respuesta en horario de mañana.',
+    });
+
+    // Búsqueda por nombre, teléfono (con o sin espacios) y Place ID
+    expect(filterTemporaryQueue(queue, { searchText: 'Negocio Prueba 2', outcomeFilter: 'all' })).toHaveLength(1);
+    expect(filterTemporaryQueue(queue, { searchText: '987654322', outcomeFilter: 'all' })).toHaveLength(1);
+    expect(filterTemporaryQueue(queue, { searchText: 'ChIJ_temp_4', outcomeFilter: 'all' })).toHaveLength(1);
+    expect(filterTemporaryQueue(queue, { searchText: '', outcomeFilter: 'interesado' })).toHaveLength(1);
+
+    // Eliminación individual y selección múltiple
+    const afterSingle = removeFromTemporaryQueue(queue, ['ChIJ_temp_1']);
+    expect(afterSingle).toHaveLength(4);
+    const afterBatch = removeFromTemporaryQueue(afterSingle, ['ChIJ_temp_3', 'ChIJ_temp_5']);
+    expect(afterBatch.map((e) => e.placeId)).not.toContain('ChIJ_temp_3');
+    expect(afterBatch).toHaveLength(2);
+
+    // Limpiar toda la cola
+    expect(clearTemporaryQueue()).toHaveLength(0);
+
+    // Render SSR de TemporaryQueueView y FollowupCrmView funciona con cuota Places agotada (429) y sin sesión Firebase
+    const tempHtml = renderToStaticMarkup(
+      React.createElement(TemporaryQueueView, {
+        queue: queue,
+        isSignedIn: false,
+        workspaceMode: 'sandbox',
+        onChangeWorkspaceMode: () => {},
+        onUpdateEntry: () => {},
+        onRemoveSelected: () => {},
+        onClearAll: () => {},
+        onPromoteToCrm: async () => null,
+        onGoToExplorer: () => {},
+      })
+    );
+    expect(tempHtml).toContain('Cola Temporal de Sesión');
+    expect(tempHtml).toContain('Negocio Prueba 2');
+    expect(tempHtml).toContain('+51 987 654 322');
+    expect(tempHtml).toContain('Mostró interés en renovación web.');
+    expect(tempHtml).toContain('no se conservarán al cerrar o reiniciar la sesión');
+    expect(tempHtml).toContain('no equivale a autorización de contacto');
+
+    const wrapperHtml = renderToStaticMarkup(
+      React.createElement(FollowupCrmView, {
+        isSignedIn: false,
+        followups: [],
+        hydrationCache: {},
+        placesQuotaBlock: { blocked: true, source: 'google_resource_exhausted', message: '429 cuota agotada' },
+        quota: null,
+        temporaryQueue: queue,
+        onUpdateTemporaryEntry: () => {},
+        onRemoveTemporarySelected: () => {},
+        onClearTemporaryQueue: () => {},
+        onPromoteTemporaryEntry: async () => null,
+        onFetchIntegrityBackup: async () => ({
+          totalDocuments: 0,
+          uniqueDocIds: 0,
+          uniquePlaceIds: 0,
+          backedUpAt: '2026-11-20T00:00:00Z',
+          records: [],
+        }),
+        onSignIn: () => {},
+        onUpdateFollowup: async () => {},
+        onCreateManualFollowup: async () => {},
+      })
+    );
+    expect(wrapperHtml).toContain('Cola Temporal de Sesión (5)');
+    expect(wrapperHtml).toContain('Negocio Prueba 5');
+  });
+
+  it('FASE 3: borrado controlado de Firestore exige respaldo previo, aísla Producción vs Sandbox, avanza por lotes con progreso y aísla errores parciales sin tocar Producción real', async () => {
+    // 1. Bloqueo obligatorio si backupVerified !== true
+    await expect(
+      deleteFollowupsBatchWithProgress(
+        {
+          uid: 'uid_test',
+          workspaceMode: 'sandbox',
+          docIds: ['doc_1'],
+          backupVerified: false,
+        },
+        {
+          commitDeleteChunk: async () => {},
+          deleteSingleDoc: async () => {},
+        }
+      )
+    ).rejects.toThrow(/respaldo JSON/i);
+
+    // 2. Borrado en lotes en Sandbox con callback de progreso y verificación estricta de colección
+    const deletedPaths: string[] = [];
+    const progressEvents: number[] = [];
+    const sandboxDocIds = Array.from({ length: 6 }, (_, i) => `sb_doc_${i + 1}`);
+
+    const okResult = await deleteFollowupsBatchWithProgress(
+      {
+        uid: 'uid_test',
+        workspaceMode: 'sandbox',
+        docIds: sandboxDocIds,
+        backupVerified: true,
+        chunkSize: 2,
+        onProgress: (p) => progressEvents.push(p.processed),
+      },
+      {
+        commitDeleteChunk: async (collectionPath, ids) => {
+          expect(collectionPath).toBe('users/uid_test/sandbox_followups');
+          for (const id of ids) deletedPaths.push(`${collectionPath}/${id}`);
+        },
+        deleteSingleDoc: async () => {},
+      }
+    );
+
+    expect(okResult.collectionPath).toBe('users/uid_test/sandbox_followups');
+    expect(okResult.deletedIds).toHaveLength(6);
+    expect(okResult.failedItems).toHaveLength(0);
+    expect(progressEvents).toEqual([2, 4, 6]);
+    expect(deletedPaths.every((p) => p.startsWith('users/uid_test/sandbox_followups/'))).toBe(true);
+
+    // 3. Simulación Producción (mock en memoria, cero llamadas a Firestore real) con fallo parcial de un documento -> aísla fallo sin abortar el resto
+    const prodResult = await deleteFollowupsBatchWithProgress(
+      {
+        uid: 'uid_test',
+        workspaceMode: 'production',
+        docIds: ['prod_1', 'prod_bad', 'prod_3'],
+        backupVerified: true,
+        chunkSize: 10,
+      },
+      {
+        commitDeleteChunk: async () => {
+          throw new Error('Batch partial failure');
+        },
+        deleteSingleDoc: async (collectionPath, id) => {
+          expect(collectionPath).toBe('users/uid_test/followups');
+          if (id === 'prod_bad') {
+            throw new Error('Missing or insufficient permissions.');
+          }
+        },
+      }
+    );
+
+    expect(prodResult.collectionPath).toBe('users/uid_test/followups');
+    expect(prodResult.deletedIds).toEqual(['prod_1', 'prod_3']);
+    expect(prodResult.failedItems).toHaveLength(1);
+    expect(prodResult.failedItems[0].id).toBe('prod_bad');
+  });
+
+  it('FASE 4 & 5: soporta exactamente los 10 resultados comerciales, separa los 4 conceptos telefónicos/legales y prioriza preselección determinística con 0 Gemini', () => {
+    expect(TEMPORARY_QUEUE_OUTCOMES).toHaveLength(10);
+    expect(TEMPORARY_QUEUE_OUTCOMES.map((o) => o.label)).toEqual([
+      'Pendiente',
+      'Contacto no autorizado',
+      'Número incorrecto',
+      'No responde',
+      'Contacto alcanzado',
+      'No interesado',
+      'Interesado',
+      'Cotización',
+      'Cliente',
+      'Descartado',
+    ]);
+
+    // Separación de los 4 conceptos en un prospecto con móvil de Maps pero SIN corroboración ni autorización legal
+    const sampleLead = buildBusinessLeadFromPlace(
+      buildSampleRawPlace(1, { websiteUri: null, internationalPhoneNumber: '+51 987 654 321' }),
+      'Veterinarias',
+      emptyExcl
+    );
+    const entryMapsOnly: TemporaryQueueEntry = {
+      placeId: sampleLead.placeId,
+      lead: sampleLead,
+      addedAt: '2026-11-20T00:00:00Z',
+      outcome: 'pendiente',
+      notes: '',
+      independentData: {
+        independentBusinessName: '',
+        independentPhone: '',
+        independentAddress: '',
+        district: 'Los Olivos',
+        independentWebsite: '',
+        independentEmail: '',
+        independentCategory: 'Veterinarias',
+        confirmedNoWebsite: false,
+        legalBasis: '',
+        provenanceConfirmed: false,
+      },
+    };
+    const concepts = evaluateTemporaryEntryFourConcepts(entryMapsOnly);
+    expect(concepts.hasValidPhoneFormat).toBe(true); // 1. formato válido
+    expect(concepts.isPhoneIndependentlyCorroborated).toBe(false); // 2. NO corroborado
+    expect(concepts.hasContactAuthorization).toBe(false); // 3. NO autorizado automáticamente
+    expect(concepts.realOutcomeLabel).toBe('Pendiente'); // 4. resultado real
+
+    // Gate legal al mapear resultado hacia CRM Definitivo
+    expect(mapTemporaryOutcomeToCrmState('interesado', '').stage).toBe('PENDIENTE DE VERIFICACIÓN');
+    expect(
+      mapTemporaryOutcomeToCrmState('interesado', 'Referido comercial directo B2B').stage
+    ).toBe('INTERESADO');
+    expect(mapTemporaryOutcomeToCrmState('cliente', 'Contrato de servicios firmado').stage).toBe(
+      'CLIENTE'
+    );
+
+    // Fase 5: Priorización determinística favorece móvil válido + sin web/solo red social vs fijo/descartado/con web activa
+    const leadSocialMovil = buildBusinessLeadFromPlace(
+      buildSampleRawPlace(9, {
+        websiteUri: 'https://www.instagram.com/vetprueba9/',
+        internationalPhoneNumber: '+51 991 333 444',
+        nationalPhoneNumber: '991 333 444',
+      }),
+      'Veterinarias',
+      emptyExcl
+    );
+    leadSocialMovil.websiteProbe = {
+      ...leadSocialMovil.websiteProbe,
+      status: 'social_only',
+      isSocialOnly: true,
+      provenance: 'independent_http',
+    };
+    leadSocialMovil.digitalScore = computeDigitalOpportunityScore(leadSocialMovil.websiteProbe, false);
+    const leadSinWebMovil = buildBusinessLeadFromPlace(
+      buildSampleRawPlace(10, {
+        websiteUri: null,
+        internationalPhoneNumber: '+51 991 222 333',
+        nationalPhoneNumber: '991 222 333',
+      }),
+      'Veterinarias',
+      emptyExcl
+    );
+    const leadSoloFijo = buildBusinessLeadFromPlace(
+      buildSampleRawPlace(11, {
+        websiteUri: null,
+        internationalPhoneNumber: '+51 1 456 7890',
+        nationalPhoneNumber: '(01) 456-7890',
+      }),
+      'Veterinarias',
+      emptyExcl
+    );
+    const batchQual = qualifyLoadedLeadsBatch([leadSoloFijo, leadSinWebMovil, leadSocialMovil], {
+      discardedPlaceIds: new Set(),
+      existingFollowups: [],
+    });
+    const socialQual = batchQual.results.find((r) => r.placeId === 'ChIJ_temp_9')!;
+    const mobileQual = batchQual.results.find((r) => r.placeId === 'ChIJ_temp_10')!;
+    const landlineQual = batchQual.results.find((r) => r.placeId === 'ChIJ_temp_11')!;
+    expect(socialQual.tier).toBe('PRIORIDAD ALTA');
+    expect(mobileQual.tier).toBe('REVISIÓN PENDIENTE');
+    expect(landlineQual.tier).toBe('NO ELEGIBLE');
+
+    const tierWeight = (t: string) =>
+      t === 'PRIORIDAD ALTA' ? 0 : t === 'REVISIÓN PENDIENTE' ? 1 : 2;
+    const orderedIds = [...batchQual.results]
+      .sort((a, b) => tierWeight(a.tier) - tierWeight(b.tier) || b.combinedPriorityScore - a.combinedPriorityScore)
+      .map((r) => r.placeId);
+    expect(orderedIds).toEqual(['ChIJ_temp_9', 'ChIJ_temp_10', 'ChIJ_temp_11']);
+    expect(mobileQual.combinedPriorityScore).toBeGreaterThan(landlineQual.combinedPriorityScore);
+  });
+});
+
+describe('14. Corrección de Continuidad: Sesión Estable (10 cambios de pestaña), Recuperación 12h/24h en Firestore, Zero-Maps-Persistence y Cero Llamadas Places', () => {
+  const emptyExcl = buildExclusionKeySet([]);
+
+  const makeExplorerRaw = (idx: number): GooglePlaceRaw => ({
+    placeId: `ChIJ_cont_${idx}`,
+    displayName: `Clínica Continuidad ${idx}`,
+    formattedAddress: `Av. Izaguirre ${200 + idx}, Los Olivos`,
+    location: { lat: -11.99, lng: -77.06 },
+    nationalPhoneNumber: `990 111 22${idx}`,
+    internationalPhoneNumber: `+51 990 111 22${idx}`,
+    websiteUri: null,
+    googleMapsUri: `https://maps.google.com/?cid=cont_${idx}`,
+    rating: 4.6,
+    userRatingCount: 18,
+    businessStatus: 'OPERATIONAL',
+    primaryTypeDisplayName: 'Veterinaria',
+  });
+
+  it('mantiene 5 negocios con nombre, teléfono y selecciones intactas tras 10 cambios de pestaña/remontaje sin llamar a Place Details', () => {
+    const leads5 = [1, 2, 3, 4, 5].map((i) =>
+      buildBusinessLeadFromPlace(makeExplorerRaw(i), 'Veterinarias', emptyExcl)
+    );
+
+    const added = addLeadsToTemporaryQueue([], leads5, {
+      district: 'Los Olivos, Lima',
+      category: 'Veterinarias',
+      ttlHours: 24,
+    });
+    expect(added.addedCount).toBe(5);
+
+    // Editar estado, nota propia, fecha, prioridad y selección persistente en el estado elevado
+    let queue = updateTemporaryQueueEntry(added.queue, 'ChIJ_cont_1', {
+      outcome: 'interesado',
+      notes: 'Contactar el martes por la tarde.',
+      followUpDate: '2026-11-24',
+      priorityLabel: 'alta',
+      isSelected: true,
+      independentData: {
+        independentBusinessName: 'Clínica Continuidad 1 S.A.C.',
+        independentPhone: '+51 990 111 221',
+        independentAddress: 'Av. Izaguirre 201, Los Olivos',
+        district: 'Los Olivos',
+        confirmedNoWebsite: true,
+        provenanceConfirmed: true,
+        independentDataProvenance: 'web_oficial',
+      },
+    });
+    queue = updateTemporaryQueueEntry(queue, 'ChIJ_cont_3', {
+      isSelected: true,
+      notes: 'Solo referencia Maps hasta confirmar fuente propia.',
+    });
+
+    // Cambiar filtros ida y vuelta nunca elimina elementos de la cola real
+    const filteredOnlySelectedOutcome = filterTemporaryQueue(queue, {
+      searchText: '',
+      outcomeFilter: 'interesado',
+    });
+    expect(filteredOnlySelectedOutcome).toHaveLength(1);
+    const restoredFilterAll = filterTemporaryQueue(queue, {
+      searchText: '',
+      outcomeFilter: 'all',
+    });
+    expect(restoredFilterAll).toHaveLength(5);
+
+    // Simular 10 cambios de pestaña / remontajes completos manteniendo activeSubView = 'temporal' y Place Details spy = 0
+    const hydrateSpy = vi.fn(async () => {});
+    let activeSubView: 'temporal' | 'crm' = 'temporal';
+    let lastRendered = '';
+    for (let step = 0; step < 10; step++) {
+      lastRendered = renderToStaticMarkup(
+        React.createElement(FollowupCrmView, {
+          isSignedIn: true,
+          followups: [],
+          hydrationCache: {},
+          placesQuotaBlock: { blocked: false, source: 'none', message: null },
+          quota: null,
+          temporaryQueue: queue,
+          subView: activeSubView,
+          onChangeSubView: (next) => {
+            activeSubView = next;
+          },
+          temporaryTtlHours: 24,
+          onChangeTemporaryTtlHours: () => {},
+          onUpdateTemporaryEntry: () => {},
+          onRemoveTemporarySelected: () => {},
+          onClearTemporaryQueue: () => {},
+          onPromoteTemporaryEntry: async () => null,
+          onFetchIntegrityBackup: async () => ({
+            totalDocuments: 0,
+            uniqueDocIds: 0,
+            uniquePlaceIds: 0,
+            backedUpAt: '2026-11-20T12:00:00Z',
+            records: [],
+          }),
+          onSignIn: () => {},
+          onUpdateFollowup: async () => {},
+          onCreateManualFollowup: async () => {},
+        })
+      );
+    }
+
+    expect(hydrateSpy).toHaveBeenCalledTimes(0);
+    expect(lastRendered).toContain('Cola de Trabajo Temporal (5 prospectos)');
+    expect(lastRendered).toContain('Eliminar seleccionados (2)');
+    expect(lastRendered).toContain('Clínica Continuidad 1');
+    expect(lastRendered).toContain('Clínica Continuidad 5');
+    expect(lastRendered).toContain('+51 990 111 225');
+  });
+
+  it('aísla el respaldo temporal en temporary_work_queue (nunca Producción followups) y bloquea persistencia de campos Maps sin procedencia', () => {
+    const uid = 'uid_test_webnex';
+    expect(getTemporaryWorkQueueCollectionPath(uid)).toBe('users/uid_test_webnex/temporary_work_queue');
+    expect(getFollowupsCollectionPath(uid, 'production')).toBe('users/uid_test_webnex/followups');
+
+    const rawMapsOnly = buildBusinessLeadFromPlace(makeExplorerRaw(2), 'Veterinarias', emptyExcl);
+    const { queue } = addLeadsToTemporaryQueue([], [rawMapsOnly], {
+      district: 'Los Olivos',
+      category: 'Veterinarias',
+      ttlHours: 12,
+    });
+
+    // Caso 1: provenanceConfirmed = false -> Firestore payload JAMÁS incluye nombre/teléfono/dirección de Google Maps
+    const uncorroboratedWithSneakyMapsText: TemporaryQueueEntry = {
+      ...queue[0],
+      notes: 'Llamar luego de almuerzo',
+      followUpDate: '2026-11-25',
+      priorityLabel: 'alta',
+      isSelected: true,
+      independentData: {
+        ...queue[0].independentData,
+        independentBusinessName: 'Clínica Continuidad 2',
+        independentPhone: '+51 990 111 222',
+        independentAddress: 'Av. Izaguirre 202, Los Olivos',
+        independentWebsite: 'https://maps-ejemplo.pe',
+        independentEmail: 'copiado@ejemplo.pe',
+        provenanceConfirmed: false,
+      },
+    };
+
+    const nowMs = Date.UTC(2026, 10, 20, 12, 0, 0);
+    const safePayload = buildTemporaryWorkItemPayload(uid, uncorroboratedWithSneakyMapsText, 12, {
+      nowMs,
+      timestampValue: 'SERVER_TS',
+    });
+
+    expect(safePayload.placeId).toBe('ChIJ_cont_2');
+    expect(safePayload.ttlHours).toBe(12);
+    expect(safePayload.expiresAtEpochMs).toBe(nowMs + 12 * 60 * 60 * 1000);
+    expect(safePayload.notes).toBe('Llamar luego de almuerzo');
+    expect(safePayload.followUpDate).toBe('2026-11-25');
+    expect(safePayload.priorityLabel).toBe('alta');
+    expect(safePayload.isSelected).toBe(true);
+    expect(safePayload.provenanceConfirmed).toBe(false);
+    // Gate estricto: todos los campos comerciales de terceros llegan vacíos a Firestore
+    expect(safePayload.independentBusinessName).toBe('');
+    expect(safePayload.independentPhone).toBe('');
+    expect(safePayload.independentAddress).toBe('');
+    expect(safePayload.independentWebsite).toBe('');
+    expect(safePayload.independentEmail).toBe('');
+
+    // Caso 2: beforeunload advierte cuando hay sesión sin autenticar o ítems solo-Maps sin datos independientes confirmados
+    expect(hasUnrecoverableSessionMapsWork([uncorroboratedWithSneakyMapsText], true)).toBe(true);
+    expect(hasUnrecoverableSessionMapsWork([uncorroboratedWithSneakyMapsText], false)).toBe(true);
+
+    // Caso 3: con procedencia independiente confirmada SÍ persiste el dato propio y deja de tener trabajo inrecuperable si todos están respaldados
+    const corroboratedEntry: TemporaryQueueEntry = {
+      ...uncorroboratedWithSneakyMapsText,
+      independentData: {
+        ...uncorroboratedWithSneakyMapsText.independentData,
+        provenanceConfirmed: true,
+        independentDataProvenance: 'directorio_propio_manual',
+      },
+    };
+    const corroboratedPayload = buildTemporaryWorkItemPayload(uid, corroboratedEntry, 24, {
+      nowMs,
+      timestampValue: 'SERVER_TS',
+    });
+    expect(corroboratedPayload.provenanceConfirmed).toBe(true);
+    expect(corroboratedPayload.independentBusinessName).toBe('Clínica Continuidad 2');
+    expect(corroboratedPayload.independentPhone).toBe('+51 990 111 222');
+    expect(corroboratedPayload.independentDataProvenance).toBe('directorio_propio_manual');
+    expect(corroboratedPayload.expiresAtEpochMs).toBe(nowMs + 24 * 60 * 60 * 1000);
+    expect(hasUnrecoverableSessionMapsWork([corroboratedEntry], true)).toBe(false);
+  });
+
+  it('recupera automáticamente tras recarga/reinicio/cambio de sesión los elementos vigentes (< 12h/24h) sin duplicados, descarta vencidos, respeta 0 Places y re-vincula si Explorador vuelve a buscar', () => {
+    const t0 = Date.UTC(2026, 10, 20, 10, 0, 0);
+    const tAfter1Hour = t0 + 60 * 60 * 1000;
+    const tAfter13Hours = t0 + 13 * 60 * 60 * 1000;
+
+    const persistedItems: PersistedTemporaryWorkItem[] = [
+      {
+        id: 'ChIJ_cont_1',
+        ownerUid: 'uid_test_webnex',
+        placeId: 'ChIJ_cont_1',
+        outcome: 'interesado',
+        notes: 'Pidió cotización plan web pyme.',
+        followUpDate: '2026-11-26',
+        isSelected: true,
+        priorityLabel: 'alta',
+        ttlHours: 24,
+        expiresAtEpochMs: t0 + 24 * 60 * 60 * 1000,
+        searchCategory: 'Veterinarias',
+        searchDistrict: 'Los Olivos',
+        provenanceConfirmed: true,
+        independentBusinessName: 'Veterinaria Corroborada Uno SAC',
+        independentPhone: '+51 990 111 221',
+        independentAddress: 'Av. Izaguirre 201',
+        district: 'Los Olivos',
+        independentWebsite: 'https://vetuno.pe',
+        independentEmail: 'hola@vetuno.pe',
+        independentCategory: 'Veterinarias',
+        confirmedNoWebsite: false,
+        legalBasis: 'Contacto B2B iniciado por formulario web',
+        independentDataProvenance: 'web_oficial',
+        promotedToCrmId: '',
+        createdAt: new Date(t0).toISOString(),
+        updatedAt: new Date(t0).toISOString(),
+      },
+      {
+        id: 'ChIJ_cont_2',
+        ownerUid: 'uid_test_webnex',
+        placeId: 'ChIJ_cont_2',
+        outcome: 'pendiente',
+        notes: 'Prospecto guardado sin corroboración independiente.',
+        followUpDate: '',
+        isSelected: false,
+        priorityLabel: 'normal',
+        ttlHours: 12,
+        expiresAtEpochMs: t0 + 12 * 60 * 60 * 1000,
+        searchCategory: 'Veterinarias',
+        searchDistrict: 'Los Olivos',
+        provenanceConfirmed: false,
+        independentBusinessName: '',
+        independentPhone: '',
+        independentAddress: '',
+        district: 'Los Olivos',
+        independentWebsite: '',
+        independentEmail: '',
+        independentCategory: 'Veterinarias',
+        confirmedNoWebsite: true,
+        legalBasis: '',
+        independentDataProvenance: '',
+        promotedToCrmId: '',
+        createdAt: new Date(t0).toISOString(),
+        updatedAt: new Date(t0).toISOString(),
+      },
+    ];
+
+    // 1. Simular ausencia de 1 hora + recarga completa (cola en RAM = [] y Explorador en RAM = [])
+    const after1h = mergeRestoredTemporaryQueue([], persistedItems, [], tAfter1Hour);
+    expect(after1h.restoredCount).toBe(2);
+    expect(after1h.expiredCount).toBe(0);
+    expect(after1h.missingMapsSessionCount).toBe(2);
+    expect(after1h.mergedQueue).toHaveLength(2);
+
+    const restoredCorroborated = after1h.mergedQueue.find((e) => e.placeId === 'ChIJ_cont_1')!;
+    const restoredMapsOnly = after1h.mergedQueue.find((e) => e.placeId === 'ChIJ_cont_2')!;
+
+    expect(restoredCorroborated.independentData.independentBusinessName).toBe('Veterinaria Corroborada Uno SAC');
+    expect(restoredCorroborated.independentData.independentPhone).toBe('+51 990 111 221');
+    expect(restoredCorroborated.notes).toBe('Pidió cotización plan web pyme.');
+    expect(restoredCorroborated.followUpDate).toBe('2026-11-26');
+    expect(restoredCorroborated.priorityLabel).toBe('alta');
+    expect(restoredCorroborated.isSelected).toBe(true);
+
+    // El elemento sin procedencia independiente NO inventa nombre ni teléfono de Maps y explica el estado honestamente
+    expect(restoredMapsOnly.mapsSessionAvailable).toBe(false);
+    expect(restoredMapsOnly.lead.name).toBe('');
+    expect(restoredMapsOnly.notes).toBe('Prospecto guardado sin corroboración independiente.');
+    const fourConceptsRestored = evaluateTemporaryEntryFourConcepts(restoredMapsOnly);
+    expect(fourConceptsRestored.hasValidPhoneFormat).toBe(false);
+    expect(fourConceptsRestored.phoneFormatLabel).toContain('Maps no en sesión');
+
+    // Render SSR de la vista restaurada muestra datos propios y bandera honesta de sesión Maps
+    const restoredHtml = renderToStaticMarkup(
+      React.createElement(TemporaryQueueView, {
+        queue: after1h.mergedQueue,
+        isSignedIn: true,
+        workspaceMode: 'sandbox',
+        onChangeWorkspaceMode: () => {},
+        ttlHours: 24,
+        onChangeTtlHours: () => {},
+        restorationNotice: 'Se recuperaron automáticamente 2 prospecto(s) vigente(s).',
+        onUpdateEntry: () => {},
+        onRemoveSelected: () => {},
+        onClearAll: () => {},
+        onPromoteToCrm: async () => null,
+        onGoToExplorer: () => {},
+      })
+    );
+    expect(restoredHtml).toContain('Veterinaria Corroborada Uno SAC');
+    expect(restoredHtml).toContain('+51 990 111 221');
+    expect(restoredHtml).toContain('Restaurado (Maps ya no en RAM)');
+    expect(restoredHtml).toContain('No disponible tras reinicio (solo sesión Maps)');
+    expect(restoredHtml).toContain('Cola de Trabajo Temporal (2 prospectos)');
+
+    // Re-sincronizar segunda vez (ej. cerrar sesión + volver a iniciar) nunca genera duplicados
+    const reSyncNoDuplicates = mergeRestoredTemporaryQueue(
+      after1h.mergedQueue,
+      persistedItems,
+      [],
+      tAfter1Hour + 5_000
+    );
+    expect(reSyncNoDuplicates.restoredCount).toBe(0);
+    expect(reSyncNoDuplicates.mergedQueue).toHaveLength(2);
+
+    // 2. Si Explorador carga después los leads en RAM, re-vincula los campos vivos de Maps con 0 Place Details
+    const newExplorerLead2 = buildBusinessLeadFromPlace(makeExplorerRaw(2), 'Veterinarias', emptyExcl);
+    const relinked = reattachSessionLeadsToTemporaryQueue(after1h.mergedQueue, [newExplorerLead2]);
+    const relinked2 = relinked.find((e) => e.placeId === 'ChIJ_cont_2')!;
+    expect(relinked2.mapsSessionAvailable).toBe(true);
+    expect(relinked2.lead.name).toBe('Clínica Continuidad 2');
+    expect(relinked2.lead.phone).toBe('+51 990 111 222');
+
+    // 3. A las 13h: el de TTL 12h caduca limpiamente mientras el de TTL 24h sigue vigente
+    const after13h = mergeRestoredTemporaryQueue([], persistedItems, [], tAfter13Hours);
+    expect(after13h.expiredCount).toBe(1);
+    expect(after13h.mergedQueue.map((e) => e.placeId)).toEqual(['ChIJ_cont_1']);
+
+    // 4. Cambio manual de TTL 24h -> 12h actualiza expiración en cola sin tocar CRM definitivo
+    const switchedTo12h = applyTtlToTemporaryQueue(after13h.mergedQueue, 12);
+    expect(switchedTo12h[0].ttlHours).toBe(12);
+    expect(computeExpiryIso('2026-11-20T10:00:00.000Z', 12).expiresAtIso).toBe(
+      '2026-11-20T22:00:00.000Z'
+    );
+  });
+});
+
+describe('15. Exportación Excel (.XLSX) de Cola Temporal (ExcelJS, +51 Texto, Tildes, 20 Filas, 0 APIs, Compliance Google Maps §3.2.3)', () => {
+  const emptyExcl = buildExclusionKeySet([]);
+
+  const buildSyntheticRaw = (idx: number): GooglePlaceRaw => ({
+    placeId: `ChIJ_xlsx_${idx}`,
+    displayName: `Negocio Maps Restringido ${idx}`,
+    formattedAddress: `Av. Maps Privada ${idx}, Los Olivos`,
+    location: { lat: -11.99, lng: -77.06 },
+    nationalPhoneNumber: `980 000 ${String(idx).padStart(3, '0')}`,
+    internationalPhoneNumber: `+51 980 000 ${String(idx).padStart(3, '0')}`,
+    websiteUri: idx % 3 === 0 ? `https://ejemplo-maps-${idx}.pe` : null,
+    googleMapsUri: `https://maps.google.com/?cid=xlsx_${idx}`,
+    rating: 4.4,
+    userRatingCount: 12,
+    businessStatus: 'OPERATIONAL',
+    primaryTypeDisplayName: 'Veterinaria',
+  });
+
+  it('exporta 20/20 prospectos a archivo .XLSX válido (pese a filtros activos), preserva +51 como texto, tildes, sin número, notas/resultados, seleccionados, 0 APIs y respeto estricto a ToS §3.2.3', async () => {
+    const raws20 = Array.from({ length: 20 }, (_, i) =>
+      buildBusinessLeadFromPlace(buildSyntheticRaw(i + 1), 'Veterinarias', emptyExcl)
+    );
+    const added = addLeadsToTemporaryQueue([], raws20, {
+      district: 'Los Olivos, Lima',
+      category: 'Veterinarias',
+    });
+    expect(added.queue).toHaveLength(20);
+
+    // Enriquecer varios registros con datos propios (sin exigir 4/4, RUC ni base legal):
+    // #1 y #2: nombres con tildes + teléfono +51 + notas + cotización/interesado + seleccionados
+    let queue = updateTemporaryQueueEntry(added.queue, 'ChIJ_xlsx_1', {
+      outcome: 'cotizacion',
+      priorityLabel: 'alta',
+      followUpDate: '2026-11-28',
+      isSelected: true,
+      notes: 'Cotización enviada para rediseño completo; llamar 4pm.',
+      independentData: {
+        independentBusinessName: 'Clínica Veterinaria San Martín – Año Nuevo',
+        independentPhone: '+51 987 654 321',
+        independentAddress: 'Jr. Áncash 450, Los Olivos',
+        district: 'Los Olivos',
+        independentWebsite: 'https://sanmartinvet.pe',
+        confirmedNoWebsite: false,
+        legalBasis: '', // NO exige base legal para exportar reporte propio
+        provenanceConfirmed: true,
+        independentDataProvenance: 'web_oficial',
+      },
+    });
+
+    queue = updateTemporaryQueueEntry(queue, 'ChIJ_xlsx_2', {
+      outcome: 'interesado',
+      priorityLabel: 'normal',
+      isSelected: true,
+      notes: 'Óptica con interés en catálogo móvil; sin teléfono registrado en web.',
+      independentData: {
+        independentBusinessName: 'Óptica Núñez S.A.C.',
+        independentPhone: '', // Registro explícito SIN número
+        independentAddress: '',
+        district: 'Los Olivos',
+        confirmedNoWebsite: true,
+        legalBasis: '',
+        provenanceConfirmed: true,
+        independentDataProvenance: 'captura_manual_webnex',
+      },
+    });
+
+    // #3 y #4: solo seleccionados + notas propias, SIN fuente independiente (datos Maps restringidos por §3.2.3)
+    queue = updateTemporaryQueueEntry(queue, 'ChIJ_xlsx_3', {
+      outcome: 'no_responde',
+      isSelected: true,
+      notes: 'Primer intento sin respuesta a las 10:30am.',
+    });
+    queue = updateTemporaryQueueEntry(queue, 'ChIJ_xlsx_4', {
+      outcome: 'contacto_no_autorizado',
+      isSelected: true,
+      notes: 'Pendiente verificar fuente independiente fuera de Maps.',
+    });
+
+    // Verificar que hay filtros activos en la UI que solo mostrarían 1 fila
+    const filteredVisible = filterTemporaryQueue(queue, {
+      searchText: 'San Martín',
+      outcomeFilter: 'cotizacion',
+    });
+    expect(filteredVisible).toHaveLength(1);
+
+    // Espiar fetch para probar CERO solicitudes a Google Places, Gemini, Firestore ni HTTP durante la exportación
+    const origFetch = globalThis.fetch;
+    const fetchSpy = vi.fn(origFetch);
+    globalThis.fetch = fetchSpy as typeof fetch;
+
+    try {
+      // 1. Exportar TODOS (20 prospectos) pese a filtros activos
+      const exportAll = await exportTemporaryQueueToExcel(queue, { scope: 'all' });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(0);
+      expect(exportAll.totalQueueCount).toBe(20);
+      expect(exportAll.exportedCount).toBe(20);
+      expect(exportAll.independentFieldsRowsCount).toBe(2);
+      expect(exportAll.mapsRestrictedRowsCount).toBe(18);
+      // Cola intacta después de exportar
+      expect(queue).toHaveLength(20);
+
+      // Verificar firma ZIP de archivo .XLSX real ('PK') y re-parsear con ExcelJS
+      expect(exportAll.buffer[0]).toBe(0x50);
+      expect(exportAll.buffer[1]).toBe(0x4b);
+
+      const WorkbookCtor = (ExcelJS as any).Workbook || (ExcelJS as any).default?.Workbook;
+      const parsedWb = new WorkbookCtor();
+      await parsedWb.xlsx.load(Buffer.from(exportAll.buffer));
+
+      const dataSheet = parsedWb.getWorksheet('Cola_Temporal_WEBNEX');
+      const complianceSheet = parsedWb.getWorksheet('Aviso_Compliance_GMP');
+      expect(dataSheet).toBeDefined();
+      expect(complianceSheet).toBeDefined();
+
+      // 1 fila de cabecera + exactamente 20 filas de datos = 21 filas
+      expect(dataSheet.actualRowCount).toBe(21);
+
+      // Mapear filas por Place ID (columna 9)
+      const rowsByPlaceId = new Map<string, any>();
+      for (let r = 2; r <= 21; r++) {
+        const row = dataSheet.getRow(r);
+        rowsByPlaceId.set(String(row.getCell(9).value || ''), row);
+      }
+      expect(rowsByPlaceId.size).toBe(20);
+
+      // A) Fila #1 (tildes + +51 como TEXTO + notas + resultado + puntajes + enlace query_place_id)
+      const row1 = rowsByPlaceId.get('ChIJ_xlsx_1');
+      expect(row1.getCell(1).value).toBe('Clínica Veterinaria San Martín – Año Nuevo');
+      expect(typeof row1.getCell(2).value).toBe('string');
+      expect(row1.getCell(2).value).toBe('+51 987 654 321');
+      expect(row1.getCell(2).numFmt).toBe('@');
+      expect(row1.getCell(3).value).toBe('Móvil');
+      expect(row1.getCell(5).value).toBe('Los Olivos');
+      expect(row1.getCell(6).value).toBe('Veterinarias');
+      expect(row1.getCell(7).value).toBe('https://sanmartinvet.pe');
+      expect(row1.getCell(10).value).toContain('query_place_id=ChIJ_xlsx_1');
+      expect(row1.getCell(11).value).toBe('Alta');
+      expect(String(row1.getCell(12).value)).toContain('Digital:');
+      expect(row1.getCell(13).value).toBe('Cotización');
+      expect(row1.getCell(15).value).toBe('Cotización enviada para rediseño completo; llamar 4pm.');
+
+      // B) Fila #2 (tildes Óptica Núñez S.A.C., SIN teléfono -> celdas vacías + dato faltante identificado)
+      const row2 = rowsByPlaceId.get('ChIJ_xlsx_2');
+      expect(row2.getCell(1).value).toBe('Óptica Núñez S.A.C.');
+      expect(row2.getCell(2).value).toBe('');
+      expect(row2.getCell(3).value).toBe('');
+      expect(row2.getCell(8).value).toBe('Sin web propia confirmada');
+      expect(row2.getCell(13).value).toBe('Interesado');
+      expect(String(row2.getCell(18).value)).toContain('Falta teléfono propio');
+
+      // C) Fila #3 (solo sesión Google Maps, provenanceConfirmed = false -> NO exporta nombre/teléfono/dirección Maps ni altera procedencia!)
+      const row3 = rowsByPlaceId.get('ChIJ_xlsx_3');
+      expect(row3.getCell(1).value).toBe('');
+      expect(row3.getCell(2).value).toBe('');
+      expect(row3.getCell(4).value).toBe('');
+      expect(row3.getCell(9).value).toBe('ChIJ_xlsx_3');
+      expect(row3.getCell(13).value).toBe('No responde');
+      expect(row3.getCell(15).value).toBe('Primer intento sin respuesta a las 10:30am.');
+      expect(String(row3.getCell(17).value)).toContain('ToS §3.2.3');
+      expect(String(row3.getCell(18).value)).toContain('restricción ToS §3.2.3');
+
+      // Verificar que jamás apareció el nombre crudo de Google Maps en el workbook exportado
+      for (let r = 2; r <= 21; r++) {
+        const nameCell = String(dataSheet.getRow(r).getCell(1).value || '');
+        expect(nameCell).not.toContain('Negocio Maps Restringido');
+      }
+
+      // 2. Exportación de SELECCIONADOS (4 seleccionados = 4 filas en hoja principal)
+      const selectedEntries = queue.filter((e) => Boolean(e.isSelected));
+      const exportSelected = await generateTemporaryQueueExcelWorkbookBuffer(selectedEntries, {
+        scope: 'selected',
+        totalQueueCount: queue.length,
+        exportedAtIso: '2026-11-20T21:35:00.000Z',
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(0);
+      expect(exportSelected.exportedCount).toBe(4);
+      expect(exportSelected.totalQueueCount).toBe(20);
+
+      const parsedSelWb = new WorkbookCtor();
+      await parsedSelWb.xlsx.load(Buffer.from(exportSelected.buffer));
+      const selSheet = parsedSelWb.getWorksheet('Cola_Temporal_WEBNEX');
+      expect(selSheet.actualRowCount).toBe(5); // 1 cabecera + 4 seleccionadas
+
+      // 3. Vista SSR incluye el botón principal solicitado y la advertencia contractual ToS §3.2.3
+      const viewHtml = renderToStaticMarkup(
+        React.createElement(TemporaryQueueView, {
+          queue,
+          isSignedIn: true,
+          workspaceMode: 'sandbox',
+          onChangeWorkspaceMode: () => {},
+          onUpdateEntry: () => {},
+          onRemoveSelected: () => {},
+          onClearAll: () => {},
+          onPromoteToCrm: async () => null,
+          onGoToExplorer: () => {},
+        })
+      );
+      expect(viewHtml).toContain('EXPORTAR TODOS A EXCEL (.XLSX)');
+      expect(viewHtml).toContain('Exportar seleccionados (4)');
+      expect(viewHtml).toContain('Google Maps Platform ToS §3.2.3');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+
+
 
 
 

@@ -17,6 +17,8 @@ import {
   GeminiAnalystError,
   hasSubstantiveIndependentEvidence,
 } from './server/geminiAnalystService';
+import { researchMissingLeadsBatch } from './server/missingDataResearcher';
+import { MissingDataResearchItemInput } from './types';
 
 function loadEnvFileIfPresent(filename: string) {
   const filePath = path.resolve(process.cwd(), filename);
@@ -238,6 +240,86 @@ export function createApiApp(quotaGuard: DailyQuotaGuard = defaultQuotaGuard) {
     );
 
     return res.json({ results });
+  });
+
+  app.post('/api/leads/research-missing', async (req, res) => {
+    try {
+      const rawItems: unknown[] = Array.isArray(req.body?.items) ? req.body.items.slice(0, 10) : [];
+      if (rawItems.length === 0) {
+        return res.json({
+          results: [],
+          placesCallsConsumed: 0,
+          quota: quotaGuard.getStatus(),
+        });
+      }
+
+      const geminiPermitted =
+        Boolean(process.env.GEMINI_API_KEY) && quotaGuard.canUseGemini();
+
+      const sanitizedItems: MissingDataResearchItemInput[] = rawItems.map((raw: any) => ({
+        placeId: String(raw?.placeId || '').trim().slice(0, 120),
+        officialWebsiteUrl:
+          typeof raw?.officialWebsiteUrl === 'string'
+            ? raw.officialWebsiteUrl.trim().slice(0, 500)
+            : null,
+        socialOrDirectoryUrl:
+          typeof raw?.socialOrDirectoryUrl === 'string'
+            ? raw.socialOrDirectoryUrl.trim().slice(0, 500)
+            : null,
+        userProvidedEvidenceText:
+          typeof raw?.userProvidedEvidenceText === 'string'
+            ? raw.userProvidedEvidenceText.slice(0, 2500)
+            : '',
+        notesText: typeof raw?.notesText === 'string' ? raw.notesText.slice(0, 1000) : '',
+        searchCategory:
+          typeof raw?.searchCategory === 'string' ? raw.searchCategory.trim().slice(0, 120) : '',
+        searchDistrict:
+          typeof raw?.searchDistrict === 'string' ? raw.searchDistrict.trim().slice(0, 120) : '',
+        allowGeminiEvidenceAnalysis:
+          Boolean(raw?.allowGeminiEvidenceAnalysis) && geminiPermitted,
+        sessionMapsRef:
+          raw?.sessionMapsRef && typeof raw.sessionMapsRef === 'object'
+            ? {
+                name: typeof raw.sessionMapsRef.name === 'string' ? raw.sessionMapsRef.name.slice(0, 160) : '',
+                address:
+                  typeof raw.sessionMapsRef.address === 'string'
+                    ? raw.sessionMapsRef.address.slice(0, 200)
+                    : '',
+                phone:
+                  typeof raw.sessionMapsRef.phone === 'string' ? raw.sessionMapsRef.phone.slice(0, 60) : '',
+                website:
+                  typeof raw.sessionMapsRef.website === 'string'
+                    ? raw.sessionMapsRef.website.slice(0, 500)
+                    : '',
+                district:
+                  typeof raw.sessionMapsRef.district === 'string'
+                    ? raw.sessionMapsRef.district.slice(0, 120)
+                    : '',
+              }
+            : undefined,
+      }));
+
+      const results = await researchMissingLeadsBatch(sanitizedItems);
+      for (const r of results) {
+        if (r.usedGemini && quotaGuard.canUseGemini()) {
+          quotaGuard.consumeGemini();
+        }
+      }
+
+      return res.json({
+        results,
+        placesCallsConsumed: 0,
+        quota: quotaGuard.getStatus(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        code: 'RESEARCH_MISSING_ERROR',
+        message: err?.message || 'Error inesperado investigando datos faltantes (0 Places).',
+        results: [],
+        placesCallsConsumed: 0,
+        quota: quotaGuard.getStatus(),
+      });
+    }
   });
 
   app.post('/api/subzones', async (req, res) => {

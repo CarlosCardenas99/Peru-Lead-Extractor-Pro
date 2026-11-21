@@ -1,20 +1,24 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, CheckCircle2, ExternalLink, Globe, ShieldCheck, Slash, UserPlus, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ExternalLink, Globe, Search, ShieldCheck, Slash, UserPlus, X } from 'lucide-react';
 import {
   BusinessLead,
   FollowupSourceKind,
   IndependentFieldSource,
+  MissingDataResearchResult,
   PhoneLineType,
   PhoneVerificationStage,
+  ResearchableFieldKey,
 } from '../types';
 import { CreateFollowupOutcome } from '../services/firebaseService';
-import { corroborateLeadsIndependently } from '../services/geminiService';
+import { researchMissingLeadDataBatch } from '../services/geminiService';
 import { analyzePeruvianPhone, getPhoneStageLabel } from '../utils/peruPhone';
 import {
   buildPersistedVerificationReport,
   encodeVerificationProvenanceEntry,
   evaluateFollowupCompleteness,
+  evaluateFourStagePipelineStatus,
   formatIndependentSourceLabel,
+  getFieldClassificationMeta,
   mergeVerificationSources,
   parseVerificationProvenanceEntry,
   PersistedVerificationReport,
@@ -120,6 +124,9 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
   const [discardReason, setDiscardReason] = useState('No califica para diseño web');
   const [saving, setSaving] = useState(false);
   const [corroborating, setCorroborating] = useState(false);
+  const [socialOrDirectoryUrl, setSocialOrDirectoryUrl] = useState('');
+  const [userEvidenceText, setUserEvidenceText] = useState('');
+  const [researchResult, setResearchResult] = useState<MissingDataResearchResult | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [saveOutcomeReport, setSaveOutcomeReport] = useState<{
     report: PersistedVerificationReport;
@@ -191,6 +198,9 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
     setProvenanceConfirmed(false);
     setVerificationSummary('');
     setLastVerifiedAt(initialSources.length > 0 ? nowIso : '');
+    setSocialOrDirectoryUrl('');
+    setUserEvidenceText('');
+    setResearchResult(null);
     setFeedback(null);
     setSaveOutcomeReport(null);
   }, [lead, searchCategory, searchDistrict]);
@@ -273,27 +283,40 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
     }
   };
 
-  const handleCorroborateOfficialWebsite = async () => {
+  const handleResearchMissingData = async () => {
     setCorroborating(true);
     setFeedback(null);
     setSaveOutcomeReport(null);
     try {
       const targetUrl = independentWebsite.trim() || lead.website || null;
-      const results = await corroborateLeadsIndependently([
+      const evidenceClean = userEvidenceText.trim();
+      const response = await researchMissingLeadDataBatch([
         {
           placeId: lead.placeId,
           officialWebsiteUrl: targetUrl,
+          socialOrDirectoryUrl: socialOrDirectoryUrl.trim() || null,
+          userProvidedEvidenceText: evidenceClean,
           notesText: notes,
           searchCategory: independentCategory || searchCategory || lead.category,
           searchDistrict: district || searchDistrict,
+          allowGeminiEvidenceAnalysis: evidenceClean.length >= 15,
+          sessionMapsRef: {
+            name: lead.name,
+            address: lead.address,
+            phone: lead.phone !== 'Sin teléfono' ? lead.phone : '',
+            website: lead.website || '',
+            district: searchDistrict.replace(/,?\s*per[uú]$/i, '').trim(),
+          },
         },
       ]);
-      const corr = results[0];
-      if (!corr) {
-        setFeedback('No se recibieron candidatos de corroboración independiente.');
+      const research = response.results[0];
+      if (!research) {
+        setFeedback('No se recibieron resultados de investigación independiente.');
         return;
       }
 
+      setResearchResult(research);
+      const corr = research.corroboration;
       const incoming: string[] = [];
       const nextFieldSources: Partial<Record<ManagedProvenanceField, IndependentFieldSource>> = {};
 
@@ -324,24 +347,26 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
       };
 
       addCandidate('nombre', independentName, setIndependentName, corr.candidates.businessName);
-      addCandidate('teléfono', independentPhone, setIndependentPhone, corr.candidates.phone);
+      if (!research.hasContradictions) {
+        addCandidate('teléfono', independentPhone, setIndependentPhone, corr.candidates.phone);
+      }
       addCandidate('dirección', independentAddress, setIndependentAddress, corr.candidates.address);
       addCandidate('distrito', district, setDistrict, corr.candidates.district);
       addCandidate('web', independentWebsite, setIndependentWebsite, corr.candidates.website);
       addCandidate('correo', independentEmail, setIndependentEmail, corr.candidates.email);
       addCandidate('categoría', independentCategory, setIndependentCategory, corr.candidates.category);
 
-      if (corr.candidates.phone && phoneStage === 'none') {
+      if (!research.hasContradictions && corr.candidates.phone && phoneStage === 'none') {
         setPhoneStage('independently_corroborated');
       }
 
       setFieldSources((prev) => ({ ...prev, ...nextFieldSources }));
       setVerificationSources((prev) => mergeVerificationSources(prev, incoming, 8));
-      setVerificationSummary(corr.summary);
-      setLastVerifiedAt(new Date().toISOString());
-      setFeedback(`${corr.summary} (0 consultas adicionales a Google Places).`);
+      setVerificationSummary(research.summary);
+      setLastVerifiedAt(research.researchedAt);
+      setFeedback(`${research.summary} (0 consultas adicionales a Google Places).`);
     } catch (err: any) {
-      setFeedback(err?.message || 'No se pudo corroborar desde el sitio web oficial.');
+      setFeedback(err?.message || 'No se pudo investigar fuentes independientes.');
     } finally {
       setCorroborating(false);
     }
@@ -664,17 +689,15 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
                 </h3>
               </div>
               <div className="flex flex-wrap gap-1.5">
-                {urlToProbe && (
-                  <button
-                    type="button"
-                    disabled={corroborating}
-                    onClick={handleCorroborateOfficialWebsite}
-                    className="px-3 py-1.5 text-xs font-semibold bg-purple-700 text-white rounded-lg hover:bg-purple-800 disabled:opacity-50 inline-flex items-center gap-1.5"
-                  >
-                    <Globe className="w-3.5 h-3.5" />
-                    {corroborating ? 'Corroborando...' : 'Corroborar Web Oficial (0 Places)'}
-                  </button>
-                )}
+                <button
+                  type="button"
+                  disabled={corroborating}
+                  onClick={handleResearchMissingData}
+                  className="px-3 py-1.5 text-xs font-semibold bg-purple-700 text-white rounded-lg hover:bg-purple-800 disabled:opacity-50 inline-flex items-center gap-1.5"
+                >
+                  <Search className="w-3.5 h-3.5" />
+                  {corroborating ? 'Investigando (0 Places)...' : 'Investigar datos faltantes (0 Places)'}
+                </button>
                 {urlToProbe && (
                   <button
                     type="button"
@@ -688,6 +711,140 @@ export const PlaceReviewDrawer: React.FC<PlaceReviewDrawerProps> = ({
                 )}
               </div>
             </div>
+
+            {(() => {
+              const pipeline = evaluateFourStagePipelineStatus({
+                placeId: lead.placeId,
+                independentBusinessName: independentName,
+                independentPhone,
+                independentAddress,
+                district,
+                independentWebsite,
+                confirmedNoWebsite,
+                independentEmail,
+                independentCategory,
+                stage: legalBasis.trim().length >= 8 ? 'CONTACTO AUTORIZADO' : 'PENDIENTE DE VERIFICACIÓN',
+                legalBasis,
+                phoneStage,
+                commercialOutcome: 'none',
+              });
+              return (
+                <div className="text-[11px] bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+                  <span>
+                    Etapa actual del embudo: <strong>{pipeline.currentStageLabel}</strong>
+                  </span>
+                  <span className="text-slate-600">
+                    Un celular válido no demuestra WhatsApp activo; fijos quedan fuera de prioridad móvil.
+                  </span>
+                </div>
+              );
+            })()}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-700 mb-1">
+                  URL pública social / directorio (FB, IG o DatosPeru)
+                </label>
+                <input
+                  type="url"
+                  value={socialOrDirectoryUrl}
+                  onChange={(e) => setSocialOrDirectoryUrl(e.target.value)}
+                  placeholder="https://facebook.com/... o datosperu.org/empresa-..."
+                  className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-700 mb-1">
+                  Evidencia comercial provista por usuario (para extracción literal)
+                </label>
+                <input
+                  type="text"
+                  value={userEvidenceText}
+                  onChange={(e) => setUserEvidenceText(e.target.value)}
+                  placeholder="Pega teléfono/dirección/correo vistos en fuente propia"
+                  className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                />
+              </div>
+            </div>
+
+            {researchResult && (
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-2 text-[11px]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-semibold text-slate-800">
+                    Clasificación multiseñal (0 Places): {researchResult.identityMatch.summary}
+                  </span>
+                  <span
+                    className={`px-2 py-0.5 border rounded font-semibold ${
+                      researchResult.hasContradictions
+                        ? 'bg-rose-50 text-rose-900 border-rose-300'
+                        : researchResult.canPersistCompleteCard
+                        ? 'bg-emerald-50 text-emerald-900 border-emerald-300'
+                        : 'bg-amber-50 text-amber-900 border-amber-300'
+                    }`}
+                  >
+                    {researchResult.hasContradictions
+                      ? 'Contradictorio'
+                      : researchResult.canPersistCompleteCard
+                      ? 'Persistible completa'
+                      : researchResult.identityMatch.identityStatusLabel === 'IDENTIDAD NO CONFIRMADA'
+                      ? 'IDENTIDAD NO CONFIRMADA'
+                      : 'Cola investigación'}
+                  </span>
+                </div>
+
+                {researchResult.contradictionAlerts.length > 0 && (
+                  <div className="bg-rose-50 border border-rose-300 text-rose-900 rounded px-2.5 py-1.5">
+                    {researchResult.contradictionAlerts.map((a, idx) => (
+                      <div key={idx}>• {a}</div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                  {(['businessName', 'phone', 'address', 'district', 'website', 'email'] as ResearchableFieldKey[]).map(
+                    (fk) => {
+                      const fc = researchResult.fieldClassifications[fk];
+                      const meta = getFieldClassificationMeta(fc.status);
+                      return (
+                        <div key={fk} className="bg-white border border-slate-200 rounded p-1.5">
+                          <div className="font-semibold text-slate-700">{fc.label}</div>
+                          <div className={`inline-block px-1 py-0.5 text-[10px] border rounded mt-0.5 ${meta.badgeClass}`}>
+                            {meta.shortLabel}
+                          </div>
+                          <div className="text-[10px] text-slate-600 truncate mt-0.5">{fc.sourceLabel}</div>
+                        </div>
+                      );
+                    }
+                  )}
+                </div>
+
+                <div className="space-y-1">
+                  {researchResult.sourceAttempts.map((att, idx) => (
+                    <div key={idx} className="text-[10px] text-slate-700">
+                      • <strong>{att.sourceName}</strong> ({att.status}
+                      {att.httpStatus ? ` · HTTP ${att.httpStatus}` : ''}): {att.detail}
+                    </div>
+                  ))}
+                </div>
+
+                {researchResult.manualReviewLinks.length > 0 && researchResult.recommendedQueue === 'research_queue' && (
+                  <div className="flex flex-wrap gap-2 pt-1 border-t border-slate-200">
+                    {researchResult.manualReviewLinks.map((lnk, i) => (
+                      <a
+                        key={i}
+                        href={lnk.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-purple-700 hover:underline font-medium"
+                      >
+                        {lnk.label}
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1">
               <div className="font-semibold text-slate-800">
